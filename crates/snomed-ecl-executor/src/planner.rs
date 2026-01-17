@@ -7,7 +7,7 @@
 use std::fmt;
 
 use snomed_ecl::EclExpression;
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 use crate::statistics::{heuristics, StatisticsService};
 

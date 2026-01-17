@@ -5,7 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 use crate::traits::EclQueryable;
 

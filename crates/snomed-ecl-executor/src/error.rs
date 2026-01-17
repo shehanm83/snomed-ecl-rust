@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 use thiserror::Error;
 
 /// Errors that can occur during ECL execution.

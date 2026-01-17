@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use snomed_ecl::EclExpression;
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 use crate::cache::{normalize_cache_key, QueryCache};
 use crate::config::ExecutorConfig;
@@ -17,16 +17,16 @@ use crate::traverser::HierarchyTraverser;
 
 /// Main ECL execution engine.
 ///
-/// The executor bridges the ECL parser (`snomed-ecl`) and the SNOMED store
-/// (`snomed-loader`) to execute ECL queries against SNOMED CT concepts.
+/// The executor bridges the ECL parser (`snomed-ecl`) and any SNOMED CT store
+/// that implements [`EclQueryable`] to execute ECL queries.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use snomed_ecl_executor::EclExecutor;
-/// use snomed_loader::SnomedStore;
+/// use snomed_ecl_executor::{EclExecutor, EclQueryable};
 ///
-/// let store = SnomedStore::new();
+/// // Assumes MyStore implements EclQueryable
+/// let store = MyStore::new();
 /// let executor = EclExecutor::new(&store);
 ///
 /// // Execute a descendant query
@@ -614,12 +614,11 @@ impl<'a> EclExecutor<'a> {
         concepts: &HashSet<SctId>,
         filter: &snomed_ecl::EclFilter,
     ) -> EclResult<HashSet<SctId>> {
-        use snomed_ecl::{EclFilter, TermMatchType};
+        use crate::traits::{Acceptability, HistoryAssociationType};
+        use snomed_ecl::{EclFilter, HistoryProfile, TermMatchType};
 
         match filter {
-            EclFilter::Term {
-                match_type, value, ..
-            } => {
+            EclFilter::Term { match_type, value } => {
                 let mut result = HashSet::new();
                 let search_term = value.to_lowercase();
 
@@ -636,6 +635,13 @@ impl<'a> EclExecutor<'a> {
                                 // Basic regex support - could use regex crate for full support
                                 term_lower.contains(&search_term)
                             }
+                            TermMatchType::Wildcard => {
+                                // Convert wildcard pattern (* and ?) to simple matching
+                                let pattern = search_term
+                                    .replace('*', "")
+                                    .replace('?', "");
+                                term_lower.contains(&pattern)
+                            }
                         }
                     });
 
@@ -644,6 +650,76 @@ impl<'a> EclExecutor<'a> {
                     }
                 }
 
+                Ok(result)
+            }
+
+            EclFilter::Language { codes } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    let descriptions = self.store.get_descriptions(concept_id);
+                    let matches = descriptions.iter().any(|desc| {
+                        codes.iter().any(|code| desc.language_code.to_lowercase() == *code)
+                    });
+                    if matches {
+                        result.insert(concept_id);
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::DescriptionType { type_ids } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    let descriptions = self.store.get_descriptions(concept_id);
+                    let matches = descriptions.iter().any(|desc| {
+                        type_ids.contains(&desc.type_id)
+                    });
+                    if matches {
+                        result.insert(concept_id);
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::Dialect { dialect_ids, acceptability } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    let descriptions = self.store.get_descriptions(concept_id);
+                    let matches = descriptions.iter().any(|desc| {
+                        let refsets = self.store.get_description_language_refsets(desc.description_id);
+                        refsets.iter().any(|membership| {
+                            let dialect_match = dialect_ids.contains(&membership.refset_id);
+                            let acc_match = acceptability.as_ref().map_or(true, |acc| {
+                                match acc {
+                                    snomed_ecl::FilterAcceptability::Preferred => {
+                                        membership.acceptability == Acceptability::Preferred
+                                    }
+                                    snomed_ecl::FilterAcceptability::Acceptable => {
+                                        membership.acceptability == Acceptability::Acceptable
+                                    }
+                                }
+                            });
+                            dialect_match && acc_match
+                        })
+                    });
+                    if matches {
+                        result.insert(concept_id);
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::CaseSignificance { case_significance_id } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    let descriptions = self.store.get_descriptions(concept_id);
+                    let matches = descriptions.iter().any(|desc| {
+                        desc.case_significance_id == *case_significance_id
+                    });
+                    if matches {
+                        result.insert(concept_id);
+                    }
+                }
                 Ok(result)
             }
 
@@ -657,21 +733,156 @@ impl<'a> EclExecutor<'a> {
                 Ok(result)
             }
 
-            EclFilter::Module(module_id) => {
+            EclFilter::Module { module_ids } => {
                 let mut result = HashSet::new();
                 for &concept_id in concepts {
-                    if self.store.get_concept_module(concept_id) == Some(*module_id) {
+                    if let Some(module_id) = self.store.get_concept_module(concept_id) {
+                        if module_ids.contains(&module_id) {
+                            result.insert(concept_id);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::EffectiveTime { operator, date } => {
+                use snomed_ecl::ComparisonOperator;
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    if let Some(effective_time) = self.store.get_concept_effective_time(concept_id) {
+                        let matches = match operator {
+                            ComparisonOperator::Equal => effective_time == *date,
+                            ComparisonOperator::NotEqual => effective_time != *date,
+                            ComparisonOperator::LessThan => effective_time < *date,
+                            ComparisonOperator::LessThanOrEqual => effective_time <= *date,
+                            ComparisonOperator::GreaterThan => effective_time > *date,
+                            ComparisonOperator::GreaterThanOrEqual => effective_time >= *date,
+                        };
+                        if matches {
+                            result.insert(concept_id);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::DefinitionStatus { is_primitive } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    if let Some(primitive) = self.store.is_concept_primitive(concept_id) {
+                        if primitive == *is_primitive {
+                            result.insert(concept_id);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::SemanticTag { tags } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    if let Some(tag) = self.store.get_semantic_tag(concept_id) {
+                        let tag_lower = tag.to_lowercase();
+                        if tags.iter().any(|t| t.to_lowercase() == tag_lower) {
+                            result.insert(concept_id);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::PreferredIn { refset_ids } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    let descriptions = self.store.get_descriptions(concept_id);
+                    let matches = descriptions.iter().any(|desc| {
+                        let refsets = self.store.get_description_language_refsets(desc.description_id);
+                        refsets.iter().any(|membership| {
+                            refset_ids.contains(&membership.refset_id)
+                                && membership.acceptability == Acceptability::Preferred
+                        })
+                    });
+                    if matches {
                         result.insert(concept_id);
                     }
                 }
                 Ok(result)
             }
 
-            EclFilter::History => {
-                // Include historical associations
+            EclFilter::AcceptableIn { refset_ids } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    let descriptions = self.store.get_descriptions(concept_id);
+                    let matches = descriptions.iter().any(|desc| {
+                        let refsets = self.store.get_description_language_refsets(desc.description_id);
+                        refsets.iter().any(|membership| {
+                            refset_ids.contains(&membership.refset_id)
+                                && membership.acceptability == Acceptability::Acceptable
+                        })
+                    });
+                    if matches {
+                        result.insert(concept_id);
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::LanguageRefSet { refset_ids } => {
+                let mut result = HashSet::new();
+                for &concept_id in concepts {
+                    let descriptions = self.store.get_descriptions(concept_id);
+                    let matches = descriptions.iter().any(|desc| {
+                        let refsets = self.store.get_description_language_refsets(desc.description_id);
+                        refsets.iter().any(|membership| {
+                            refset_ids.contains(&membership.refset_id)
+                        })
+                    });
+                    if matches {
+                        result.insert(concept_id);
+                    }
+                }
+                Ok(result)
+            }
+
+            EclFilter::Id { ids } => {
+                // Filter to only concepts that are in the ID list
+                let id_set: HashSet<_> = ids.iter().copied().collect();
+                Ok(concepts.intersection(&id_set).copied().collect())
+            }
+
+            EclFilter::History { profile } => {
+                // Include historical associations based on profile
                 let mut result = concepts.clone();
                 for &concept_id in concepts {
-                    let historical = self.store.get_historical_associations(concept_id);
+                    let historical = match profile {
+                        None | Some(HistoryProfile::Max) => {
+                            // All historical associations
+                            self.store.get_historical_associations(concept_id)
+                        }
+                        Some(HistoryProfile::Min) => {
+                            // SAME_AS only
+                            self.store.get_historical_associations_by_type(
+                                concept_id,
+                                HistoryAssociationType::SameAs,
+                            )
+                        }
+                        Some(HistoryProfile::Mod) => {
+                            // SAME_AS, REPLACED_BY, POSSIBLY_EQUIVALENT_TO
+                            let mut assocs = self.store.get_historical_associations_by_type(
+                                concept_id,
+                                HistoryAssociationType::SameAs,
+                            );
+                            assocs.extend(self.store.get_historical_associations_by_type(
+                                concept_id,
+                                HistoryAssociationType::ReplacedBy,
+                            ));
+                            assocs.extend(self.store.get_historical_associations_by_type(
+                                concept_id,
+                                HistoryAssociationType::PossiblyEquivalentTo,
+                            ));
+                            assocs
+                        }
+                    };
                     result.extend(historical);
                 }
                 Ok(result)
@@ -679,6 +890,7 @@ impl<'a> EclExecutor<'a> {
 
             EclFilter::Member { .. } => {
                 // Member filters require refset access - return as-is for now
+                // Full implementation would filter based on refset member fields
                 Ok(concepts.clone())
             }
         }

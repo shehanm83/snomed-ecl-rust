@@ -3,50 +3,52 @@
 //! This module defines the [`EclQueryable`] trait that must be implemented
 //! by any SNOMED CT store that wants to execute ECL queries.
 //!
-//! # Architecture Note
+//! # Implementing EclQueryable
 //!
-//! This crate intentionally does NOT depend on `snomed-loader` to avoid
-//! cyclic dependencies. The trait is defined here, but implementations
-//! for concrete store types should be done in the consuming crate.
-//!
-//! # Example: Implementing EclQueryable for SnomedStore
-//!
-//! In your `snomed-service` crate (or wherever you use the executor):
+//! To use the ECL executor with your SNOMED CT store, implement the
+//! [`EclQueryable`] trait:
 //!
 //! ```ignore
-//! use snomed_ecl_executor::{EclQueryable, EclExecutor};
-//! use snomed_loader::SnomedStore;
-//! use snomed_types::SctId;
+//! use snomed_ecl_executor::{EclQueryable, EclExecutor, SctId};
 //!
-//! impl EclQueryable for SnomedStore {
+//! struct MyStore {
+//!     // Your store implementation...
+//! }
+//!
+//! impl EclQueryable for MyStore {
 //!     fn get_children(&self, concept_id: SctId) -> Vec<SctId> {
-//!         self.get_children(concept_id)
+//!         // Return direct children (concepts with IS_A relationship to this concept)
+//!         todo!()
 //!     }
 //!
 //!     fn get_parents(&self, concept_id: SctId) -> Vec<SctId> {
-//!         self.get_parents(concept_id)
+//!         // Return direct parents (this concept has IS_A relationship to them)
+//!         todo!()
 //!     }
 //!
 //!     fn has_concept(&self, concept_id: SctId) -> bool {
-//!         self.has_concept(concept_id)
+//!         // Return true if concept exists in the store
+//!         todo!()
 //!     }
 //!
 //!     fn all_concept_ids(&self) -> Box<dyn Iterator<Item = SctId> + '_> {
-//!         Box::new(self.concept_ids().copied())
+//!         // Return iterator over all concept IDs (for wildcard queries)
+//!         todo!()
 //!     }
 //!
-//!     fn get_refset_members(&self, _refset_id: SctId) -> Vec<SctId> {
-//!         Vec::new() // Implement when refset support is added
+//!     fn get_refset_members(&self, refset_id: SctId) -> Vec<SctId> {
+//!         // Return members of a reference set (for ^ queries)
+//!         Vec::new() // Return empty if not supported
 //!     }
 //! }
 //!
-//! // Now you can use EclExecutor with SnomedStore
-//! let store = SnomedStore::new();
+//! // Now you can use EclExecutor with your store
+//! let store = MyStore { /* ... */ };
 //! let executor = EclExecutor::new(&store);
 //! let result = executor.execute("< 73211009")?;
 //! ```
 
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 // =============================================================================
 // Relationship Info (for attribute queries)
@@ -88,13 +90,58 @@ pub struct ConcreteRelationshipInfo {
 /// Description information for term filtering.
 #[derive(Debug, Clone)]
 pub struct DescriptionInfo {
+    /// The description ID.
+    pub description_id: SctId,
     /// The description term.
     pub term: String,
     /// The language code (e.g., "en").
-    pub language: String,
+    pub language_code: String,
     /// The description type ID (FSN, synonym, etc.).
+    /// - 900000000000003001 = Fully specified name
+    /// - 900000000000013009 = Synonym
+    /// - 900000000000550004 = Definition
     pub type_id: SctId,
+    /// Case significance ID.
+    /// - 900000000000448009 = Case insensitive
+    /// - 900000000000017005 = Case sensitive (initial character)
+    /// - 900000000000020002 = Case sensitive (entire term)
+    pub case_significance_id: SctId,
     /// Whether the description is active.
+    pub active: bool,
+    /// Effective time in YYYYMMDD format.
+    pub effective_time: Option<u32>,
+    /// Module ID.
+    pub module_id: SctId,
+}
+
+/// Acceptability of a description in a language reference set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acceptability {
+    /// Preferred term in this dialect.
+    Preferred,
+    /// Acceptable term in this dialect.
+    Acceptable,
+}
+
+/// Language reference set membership for a description.
+#[derive(Debug, Clone)]
+pub struct LanguageRefsetMember {
+    /// The language reference set ID (dialect).
+    pub refset_id: SctId,
+    /// Acceptability in this refset.
+    pub acceptability: Acceptability,
+}
+
+/// Concept metadata for filtering.
+#[derive(Debug, Clone)]
+pub struct ConceptInfo {
+    /// Whether the concept is primitive (true) or fully defined (false).
+    pub is_primitive: bool,
+    /// Module ID.
+    pub module_id: SctId,
+    /// Effective time in YYYYMMDD format.
+    pub effective_time: Option<u32>,
+    /// Whether the concept is active.
     pub active: bool,
 }
 
@@ -214,6 +261,103 @@ pub trait EclQueryable: Send + Sync {
         let _ = concept_id;
         None
     }
+
+    // =========================================================================
+    // Filter Support Methods (ECL 2.2)
+    // =========================================================================
+
+    /// Gets full concept metadata for filtering.
+    ///
+    /// Returns definition status, module, effective time, and active status.
+    fn get_concept_info(&self, concept_id: SctId) -> Option<ConceptInfo> {
+        let _ = concept_id;
+        None
+    }
+
+    /// Gets language reference set memberships for a description.
+    ///
+    /// Returns which language reference sets the description belongs to
+    /// and its acceptability (preferred/acceptable) in each.
+    fn get_description_language_refsets(&self, description_id: SctId) -> Vec<LanguageRefsetMember> {
+        let _ = description_id;
+        Vec::new()
+    }
+
+    /// Gets the semantic tag for a concept (extracted from FSN).
+    ///
+    /// The semantic tag is the text in parentheses at the end of the FSN.
+    /// For example, "Diabetes mellitus (disorder)" has semantic tag "disorder".
+    fn get_semantic_tag(&self, concept_id: SctId) -> Option<String> {
+        // Default implementation: try to extract from FSN
+        let descriptions = self.get_descriptions(concept_id);
+        for desc in descriptions {
+            // FSN type ID
+            if desc.type_id == 900000000000003001 {
+                // Extract semantic tag from parentheses
+                if let Some(start) = desc.term.rfind('(') {
+                    if let Some(end) = desc.term.rfind(')') {
+                        if start < end {
+                            return Some(desc.term[start + 1..end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Gets the effective time for a concept in YYYYMMDD format.
+    fn get_concept_effective_time(&self, concept_id: SctId) -> Option<u32> {
+        self.get_concept_info(concept_id).and_then(|info| info.effective_time)
+    }
+
+    /// Checks if a concept is primitive (vs. fully defined).
+    fn is_concept_primitive(&self, concept_id: SctId) -> Option<bool> {
+        self.get_concept_info(concept_id).map(|info| info.is_primitive)
+    }
+
+    /// Gets inbound relationships (where this concept is the destination).
+    ///
+    /// Used for reverse attribute queries (R flag in ECL).
+    fn get_inbound_relationships(&self, concept_id: SctId) -> Vec<RelationshipInfo> {
+        let _ = concept_id;
+        Vec::new()
+    }
+
+    /// Gets historical associations for a concept.
+    ///
+    /// Returns associated concepts based on historical association type:
+    /// - SAME_AS (900000000000527005)
+    /// - REPLACED_BY (900000000000526001)
+    /// - POSSIBLY_EQUIVALENT_TO (900000000000523009)
+    /// - etc.
+    fn get_historical_associations_by_type(
+        &self,
+        concept_id: SctId,
+        association_type: HistoryAssociationType,
+    ) -> Vec<SctId> {
+        let _ = (concept_id, association_type);
+        Vec::new()
+    }
+}
+
+/// Historical association types for history supplements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAssociationType {
+    /// SAME_AS association (900000000000527005).
+    SameAs,
+    /// REPLACED_BY association (900000000000526001).
+    ReplacedBy,
+    /// POSSIBLY_EQUIVALENT_TO association (900000000000523009).
+    PossiblyEquivalentTo,
+    /// ALTERNATIVE association (900000000000530003).
+    Alternative,
+    /// WAS_A association (900000000000528000).
+    WasA,
+    /// MOVED_TO association (900000000000524003).
+    MovedTo,
+    /// MOVED_FROM association (900000000000525002).
+    MovedFrom,
 }
 
 #[cfg(test)]
