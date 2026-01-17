@@ -19,8 +19,10 @@ snomed-ecl = { path = "crates/snomed-ecl" }
 snomed-ecl-executor = { path = "crates/snomed-ecl-executor" }
 
 # External - from snomed-ct-loader-rust
+# Only snomed-types is needed (for SctId). snomed-loader is NOT included
+# to avoid cyclic dependencies. The EclQueryable trait implementation
+# for SnomedStore should be done in snomed-service.
 snomed-types = { git = "https://github.com/shehanm83/snomed-ct-loader-rust.git", branch = "feature/snomed-types-crate" }
-snomed-loader = { git = "https://github.com/shehanm83/snomed-ct-loader-rust.git", branch = "feature/snomed-types-crate" }
 
 # Parsing
 nom = "7.1"

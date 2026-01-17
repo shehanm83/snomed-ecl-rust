@@ -16,7 +16,10 @@ path = "src/lib.rs"
 # Internal crates (SNOMED infrastructure)
 snomed-types = { workspace = true }
 snomed-ecl = { workspace = true }
-snomed-loader = { workspace = true }
+# NOTE: snomed-loader is NOT a dependency here to avoid cyclic dependencies.
+# The EclQueryable trait is defined here, but implementations for concrete
+# store types (like SnomedStore) should be done in the consuming crate
+# (e.g., snomed-service).
 
 # Core dependencies
 thiserror = { workspace = true }

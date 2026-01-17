@@ -1,4 +1,50 @@
 //! Traits for ECL query execution.
+//!
+//! This module defines the [`EclQueryable`] trait that must be implemented
+//! by any SNOMED CT store that wants to execute ECL queries.
+//!
+//! # Architecture Note
+//!
+//! This crate intentionally does NOT depend on `snomed-loader` to avoid
+//! cyclic dependencies. The trait is defined here, but implementations
+//! for concrete store types should be done in the consuming crate.
+//!
+//! # Example: Implementing EclQueryable for SnomedStore
+//!
+//! In your `snomed-service` crate (or wherever you use the executor):
+//!
+//! ```ignore
+//! use snomed_ecl_executor::{EclQueryable, EclExecutor};
+//! use snomed_loader::SnomedStore;
+//! use snomed_types::SctId;
+//!
+//! impl EclQueryable for SnomedStore {
+//!     fn get_children(&self, concept_id: SctId) -> Vec<SctId> {
+//!         self.get_children(concept_id)
+//!     }
+//!
+//!     fn get_parents(&self, concept_id: SctId) -> Vec<SctId> {
+//!         self.get_parents(concept_id)
+//!     }
+//!
+//!     fn has_concept(&self, concept_id: SctId) -> bool {
+//!         self.has_concept(concept_id)
+//!     }
+//!
+//!     fn all_concept_ids(&self) -> Box<dyn Iterator<Item = SctId> + '_> {
+//!         Box::new(self.concept_ids().copied())
+//!     }
+//!
+//!     fn get_refset_members(&self, _refset_id: SctId) -> Vec<SctId> {
+//!         Vec::new() // Implement when refset support is added
+//!     }
+//! }
+//!
+//! // Now you can use EclExecutor with SnomedStore
+//! let store = SnomedStore::new();
+//! let executor = EclExecutor::new(&store);
+//! let result = executor.execute("< 73211009")?;
+//! ```
 
 use snomed_types::SctId;
 
@@ -57,18 +103,21 @@ pub struct DescriptionInfo {
 /// This trait abstracts the underlying SNOMED store implementation,
 /// allowing the executor to work with different store implementations.
 ///
-/// # Example
+/// Implement this trait for your store type in your application crate.
+/// See the module-level documentation for a complete example.
 ///
-/// ```ignore
-/// use snomed_ecl_executor::EclQueryable;
-/// use snomed_loader::SnomedStore;
+/// # Required Methods
 ///
-/// let store = SnomedStore::new();
-/// // SnomedStore implements EclQueryable
+/// - [`get_children`](Self::get_children) - Get direct children via IS_A
+/// - [`get_parents`](Self::get_parents) - Get direct parents via IS_A
+/// - [`has_concept`](Self::has_concept) - Check if concept exists
+/// - [`all_concept_ids`](Self::all_concept_ids) - Iterate all concepts (for wildcards)
+/// - [`get_refset_members`](Self::get_refset_members) - Get reference set members
 ///
-/// let children = store.get_children(73211009);
-/// let parents = store.get_parents(73211009);
-/// ```
+/// # Optional Methods (with defaults)
+///
+/// Advanced ECL features have default implementations that return empty results.
+/// Override them to support attribute refinements, filters, etc.
 pub trait EclQueryable: Send + Sync {
     /// Gets direct children of a concept (via IS_A relationships).
     ///
@@ -166,37 +215,6 @@ pub trait EclQueryable: Send + Sync {
         None
     }
 }
-
-// =============================================================================
-// SnomedStore Implementation
-// =============================================================================
-//
-// The implementation below requires SnomedStore to be available in snomed-loader.
-// Once snomed-loader's SnomedStore is published, uncomment and use:
-//
-// ```rust
-// impl EclQueryable for snomed_loader::SnomedStore {
-//     fn get_children(&self, concept_id: SctId) -> Vec<SctId> {
-//         self.get_children(concept_id)
-//     }
-//
-//     fn get_parents(&self, concept_id: SctId) -> Vec<SctId> {
-//         self.get_parents(concept_id)
-//     }
-//
-//     fn has_concept(&self, concept_id: SctId) -> bool {
-//         self.has_concept(concept_id)
-//     }
-//
-//     fn all_concept_ids(&self) -> Box<dyn Iterator<Item = SctId> + '_> {
-//         Box::new(self.concept_ids().copied())
-//     }
-//
-//     fn get_refset_members(&self, _refset_id: SctId) -> Vec<SctId> {
-//         Vec::new()
-//     }
-// }
-// ```
 
 #[cfg(test)]
 mod tests {
