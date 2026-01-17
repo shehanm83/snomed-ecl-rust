@@ -1,0 +1,34 @@
+[package]
+name = "snomed-ecl-executor"
+version.workspace = true
+edition.workspace = true
+description = "High-performance ECL execution engine for SNOMED CT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shehanm83/snomed-ecl-rust"
+keywords = ["snomed", "ecl", "healthcare", "terminology"]
+categories = ["science", "parsing"]
+
+[lib]
+name = "snomed_ecl_executor"
+path = "src/lib.rs"
+
+[dependencies]
+# Internal crates (SNOMED infrastructure)
+snomed-types = { workspace = true }
+snomed-ecl = { workspace = true }
+snomed-loader = { workspace = true }
+
+# Core dependencies
+thiserror = { workspace = true }
+lru = { workspace = true }
+
+# Optional parallel execution
+rayon = { workspace = true, optional = true }
+
+[features]
+default = []
+parallel = ["rayon"]
+serde = ["snomed-types/serde", "snomed-ecl/serde"]
+
+[dev-dependencies]
+# criterion = { workspace = true }  # Enable when benchmarks are added

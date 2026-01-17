@@ -1,0 +1,22 @@
+[package]
+name = "snomed-ecl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Parser for SNOMED CT Expression Constraint Language (ECL)"
+keywords = ["snomed", "ecl", "parser", "healthcare", "terminology"]
+categories = ["parsing", "science"]
+
+[dependencies]
+nom = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true }
+snomed-types = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde", "snomed-types/serde"]

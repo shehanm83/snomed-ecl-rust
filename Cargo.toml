@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/snomed-ecl",
+    "crates/snomed-ecl-executor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/shehanm83/snomed-ecl-rust"
+keywords = ["snomed", "ecl", "healthcare", "terminology", "clinical"]
+categories = ["parsing", "science"]
+
+[workspace.dependencies]
+# Internal crates
+snomed-ecl = { path = "crates/snomed-ecl" }
+snomed-ecl-executor = { path = "crates/snomed-ecl-executor" }
+
+# External - from snomed-ct-loader-rust
+snomed-types = { git = "https://github.com/shehanm83/snomed-ct-loader-rust.git", branch = "feature/snomed-types-crate" }
+snomed-loader = { git = "https://github.com/shehanm83/snomed-ct-loader-rust.git", branch = "feature/snomed-types-crate" }
+
+# Parsing
+nom = "7.1"
+
+# Error handling
+thiserror = "2.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Collections
+hashbrown = "0.14"
+
+# Parallelism (optional)
+rayon = "1.10"
+
+# Caching
+lru = "0.12"
+
+# Testing
+criterion = "0.5"
