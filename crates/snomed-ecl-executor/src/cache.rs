@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 use crate::config::CacheConfig;
 

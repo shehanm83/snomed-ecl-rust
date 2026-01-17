@@ -13,13 +13,8 @@ name = "snomed_ecl_executor"
 path = "src/lib.rs"
 
 [dependencies]
-# Internal crates (SNOMED infrastructure)
-snomed-types = { workspace = true }
+# ECL parser (provides SctId type alias and AST)
 snomed-ecl = { workspace = true }
-# NOTE: snomed-loader is NOT a dependency here to avoid cyclic dependencies.
-# The EclQueryable trait is defined here, but implementations for concrete
-# store types (like SnomedStore) should be done in the consuming crate
-# (e.g., snomed-service).
 
 # Core dependencies
 thiserror = { workspace = true }
@@ -31,7 +26,7 @@ rayon = { workspace = true, optional = true }
 [features]
 default = []
 parallel = ["rayon"]
-serde = ["snomed-types/serde", "snomed-ecl/serde"]
+serde = ["snomed-ecl/serde"]
 
 [dev-dependencies]
 # criterion = { workspace = true }  # Enable when benchmarks are added

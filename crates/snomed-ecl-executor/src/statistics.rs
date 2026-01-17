@@ -5,13 +5,13 @@
 
 use std::collections::HashMap;
 
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 use crate::traits::EclQueryable;
 
 /// Well-known SNOMED CT concept IDs with pre-computed statistics.
 pub mod well_known {
-    use snomed_types::SctId;
+    use snomed_ecl::SctId;
 
     /// Clinical finding (finding) - ~400K descendants
     pub const CLINICAL_FINDING: SctId = 404684003;

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 /// Result of an ECL query execution.
 ///

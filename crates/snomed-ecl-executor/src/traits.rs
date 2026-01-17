@@ -3,50 +3,52 @@
 //! This module defines the [`EclQueryable`] trait that must be implemented
 //! by any SNOMED CT store that wants to execute ECL queries.
 //!
-//! # Architecture Note
+//! # Implementing EclQueryable
 //!
-//! This crate intentionally does NOT depend on `snomed-loader` to avoid
-//! cyclic dependencies. The trait is defined here, but implementations
-//! for concrete store types should be done in the consuming crate.
-//!
-//! # Example: Implementing EclQueryable for SnomedStore
-//!
-//! In your `snomed-service` crate (or wherever you use the executor):
+//! To use the ECL executor with your SNOMED CT store, implement the
+//! [`EclQueryable`] trait:
 //!
 //! ```ignore
-//! use snomed_ecl_executor::{EclQueryable, EclExecutor};
-//! use snomed_loader::SnomedStore;
-//! use snomed_types::SctId;
+//! use snomed_ecl_executor::{EclQueryable, EclExecutor, SctId};
 //!
-//! impl EclQueryable for SnomedStore {
+//! struct MyStore {
+//!     // Your store implementation...
+//! }
+//!
+//! impl EclQueryable for MyStore {
 //!     fn get_children(&self, concept_id: SctId) -> Vec<SctId> {
-//!         self.get_children(concept_id)
+//!         // Return direct children (concepts with IS_A relationship to this concept)
+//!         todo!()
 //!     }
 //!
 //!     fn get_parents(&self, concept_id: SctId) -> Vec<SctId> {
-//!         self.get_parents(concept_id)
+//!         // Return direct parents (this concept has IS_A relationship to them)
+//!         todo!()
 //!     }
 //!
 //!     fn has_concept(&self, concept_id: SctId) -> bool {
-//!         self.has_concept(concept_id)
+//!         // Return true if concept exists in the store
+//!         todo!()
 //!     }
 //!
 //!     fn all_concept_ids(&self) -> Box<dyn Iterator<Item = SctId> + '_> {
-//!         Box::new(self.concept_ids().copied())
+//!         // Return iterator over all concept IDs (for wildcard queries)
+//!         todo!()
 //!     }
 //!
-//!     fn get_refset_members(&self, _refset_id: SctId) -> Vec<SctId> {
-//!         Vec::new() // Implement when refset support is added
+//!     fn get_refset_members(&self, refset_id: SctId) -> Vec<SctId> {
+//!         // Return members of a reference set (for ^ queries)
+//!         Vec::new() // Return empty if not supported
 //!     }
 //! }
 //!
-//! // Now you can use EclExecutor with SnomedStore
-//! let store = SnomedStore::new();
+//! // Now you can use EclExecutor with your store
+//! let store = MyStore { /* ... */ };
 //! let executor = EclExecutor::new(&store);
 //! let result = executor.execute("< 73211009")?;
 //! ```
 
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 // =============================================================================
 // Relationship Info (for attribute queries)

@@ -2,13 +2,13 @@
 //!
 //! High-performance ECL execution engine for SNOMED CT.
 //!
-//! This crate provides an **independent** ECL executor that bridges the
-//! [`snomed-ecl`] parser and [`snomed-loader`] store to execute Expression
-//! Constraint Language (ECL) queries against SNOMED CT concepts.
+//! This crate provides a **standalone** ECL executor that uses the [`snomed-ecl`]
+//! parser to execute Expression Constraint Language (ECL) queries against any
+//! SNOMED CT store that implements the [`EclQueryable`] trait.
 //!
 //! ## Key Features
 //!
-//! - **Zero MCP dependencies** - Use directly via `cargo add snomed-ecl-executor`
+//! - **Store-agnostic** - Works with any store implementing [`EclQueryable`]
 //! - **Sub-second queries** - Execute ECL over 3M+ concepts in <100ms
 //! - **Configurable caching** - LRU cache for frequently-used queries
 //! - **Optional parallelism** - Enable `parallel` feature for multi-threaded traversal
@@ -16,14 +16,12 @@
 //! ## Quick Start
 //!
 //! ```ignore
-//! use snomed_ecl_executor::{EclExecutor, ExecutorConfig};
-//! use snomed_loader::SnomedStore;
+//! use snomed_ecl_executor::{EclExecutor, EclQueryable, SctId};
 //!
-//! // Load your SNOMED store
-//! let store = SnomedStore::new();
-//! // ... load RF2 files ...
+//! // Your store must implement EclQueryable (see trait documentation)
+//! let store = MyStore::new();
 //!
-//! // Create executor with default config
+//! // Create executor
 //! let executor = EclExecutor::new(&store);
 //!
 //! // Execute ECL query
@@ -82,16 +80,14 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                    snomed-ecl-executor                       │
 //! │                                                              │
-//! │  EclExecutor                                                 │
+//! │  EclExecutor<T: EclQueryable>                                │
 //! │  ├── parse ECL string → EclExpression (snomed-ecl)          │
 //! │  ├── traverse hierarchy (via EclQueryable trait)            │
 //! │  ├── apply set operations (AND/OR/MINUS)                    │
 //! │  └── return QueryResult with stats                          │
 //! │                                                              │
-//! │  Dependencies:                                               │
-//! │  ├── snomed-ecl    - ECL parser (AST)                       │
-//! │  ├── snomed-loader - SnomedStore (implements EclQueryable)  │
-//! │  └── snomed-types  - SctId, Rf2Concept types                │
+//! │  Your Application:                                           │
+//! │  └── impl EclQueryable for YourStore { ... }                │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
@@ -121,9 +117,8 @@ pub use traits::{
 };
 pub use traverser::HierarchyTraverser;
 
-// Re-export commonly used types from dependencies for convenience
-pub use snomed_ecl::EclExpression;
-pub use snomed_types::SctId;
+// Re-export commonly used types from snomed-ecl for convenience
+pub use snomed_ecl::{EclExpression, SctId};
 
 #[cfg(test)]
 mod tests {

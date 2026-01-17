@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use snomed_ecl::EclExpression;
-use snomed_types::SctId;
+use snomed_ecl::SctId;
 
 use crate::cache::{normalize_cache_key, QueryCache};
 use crate::config::ExecutorConfig;
@@ -17,16 +17,16 @@ use crate::traverser::HierarchyTraverser;
 
 /// Main ECL execution engine.
 ///
-/// The executor bridges the ECL parser (`snomed-ecl`) and the SNOMED store
-/// (`snomed-loader`) to execute ECL queries against SNOMED CT concepts.
+/// The executor bridges the ECL parser (`snomed-ecl`) and any SNOMED CT store
+/// that implements [`EclQueryable`] to execute ECL queries.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use snomed_ecl_executor::EclExecutor;
-/// use snomed_loader::SnomedStore;
+/// use snomed_ecl_executor::{EclExecutor, EclQueryable};
 ///
-/// let store = SnomedStore::new();
+/// // Assumes MyStore implements EclQueryable
+/// let store = MyStore::new();
 /// let executor = EclExecutor::new(&store);
 ///
 /// // Execute a descendant query

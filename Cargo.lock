@@ -187,7 +187,6 @@ dependencies = [
  "nom",
  "serde",
  "serde_json",
- "snomed-types",
  "thiserror",
 ]
 
@@ -198,16 +197,7 @@ dependencies = [
  "lru",
  "rayon",
  "snomed-ecl",
- "snomed-types",
  "thiserror",
-]
-
-[[package]]
-name = "snomed-types"
-version = "0.1.0"
-source = "git+https://github.com/shehanm83/snomed-ct-loader-rust.git?branch=feature%2Fsnomed-types-crate#2337967eea74fe897bf1cb028ad36fb2513327dd"
-dependencies = [
- "serde",
 ]
 
 [[package]]
