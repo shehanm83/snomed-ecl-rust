@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/snomed-ecl",
     "crates/snomed-ecl-executor",
+    "crates/snomed-ecl-optimizer",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ categories = ["parsing", "science"]
 # Internal crates
 snomed-ecl = { path = "crates/snomed-ecl" }
 snomed-ecl-executor = { path = "crates/snomed-ecl-executor" }
+snomed-ecl-optimizer = { path = "crates/snomed-ecl-optimizer" }
 
 # No external dependencies - this workspace is fully self-contained.
 # SctId is defined in snomed-ecl crate (pub type SctId = u64).
@@ -42,3 +44,11 @@ lru = "0.12"
 
 # Testing
 criterion = "0.5"
+tempfile = "3.15"
+
+# Optimizer crate dependencies (optional features)
+roaring = "0.10"
+bincode = "2.0"
+sha2 = "0.10"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
