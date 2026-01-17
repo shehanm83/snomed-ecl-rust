@@ -69,7 +69,8 @@ mod parser;
 
 pub use ast::{
     AttributeConstraint, AttributeGroup, Cardinality, ComparisonOperator, ConcreteValue,
-    EclExpression, EclFilter, Refinement, RefinementOperator, TermMatchType,
+    EclExpression, EclFilter, FilterAcceptability, HistoryProfile, MemberFieldValue,
+    Refinement, RefinementOperator, TermMatchType,
 };
 pub use error::{EclError, EclResult};
 pub use parser::parse;

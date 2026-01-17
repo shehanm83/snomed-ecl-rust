@@ -93,7 +93,7 @@ impl std::fmt::Display for Cardinality {
 /// A single attribute constraint within a refinement.
 ///
 /// Example: `363698007 |Finding site| = << 39057004 |Pulmonary structure|`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AttributeConstraint {
     /// Optional cardinality constraint.
@@ -124,7 +124,7 @@ impl std::fmt::Display for AttributeConstraint {
 /// the same relationship group.
 ///
 /// Example: `{ 363698007 = << 39057004, 116676008 = << 415582006 }`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AttributeGroup {
     /// Optional cardinality for the group itself.
@@ -152,7 +152,7 @@ impl std::fmt::Display for AttributeGroup {
 /// Refinement clause containing attribute constraints.
 ///
 /// A refinement can have both ungrouped attributes and grouped attributes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Refinement {
     /// Ungrouped attribute constraints (AND-combined).
@@ -192,6 +192,8 @@ pub enum ConcreteValue {
     Decimal(f64),
     /// String value: `#"text"`
     String(String),
+    /// Boolean value: `#true` or `#false`
+    Boolean(bool),
 }
 
 impl std::fmt::Display for ConcreteValue {
@@ -200,6 +202,7 @@ impl std::fmt::Display for ConcreteValue {
             ConcreteValue::Integer(n) => write!(f, "#{}", n),
             ConcreteValue::Decimal(n) => write!(f, "#{}", n),
             ConcreteValue::String(s) => write!(f, "#\"{}\"", s),
+            ConcreteValue::Boolean(b) => write!(f, "#{}", b),
         }
     }
 }
@@ -241,14 +244,16 @@ impl std::fmt::Display for ComparisonOperator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TermMatchType {
-    /// Contains the term.
+    /// Contains the term (default): `term = "x"`
     Contains,
-    /// Starts with the term.
+    /// Starts with the term: `term startsWith "x"`
     StartsWith,
-    /// Matches regex pattern.
+    /// Matches regex pattern: `term regex "x.*"`
     Regex,
-    /// Exact match.
+    /// Exact match: `term == "x"`
     Exact,
+    /// Wildcard matching: `term wild "diab*"`
+    Wildcard,
 }
 
 impl std::fmt::Display for TermMatchType {
@@ -258,40 +263,314 @@ impl std::fmt::Display for TermMatchType {
             TermMatchType::StartsWith => write!(f, "term startsWith"),
             TermMatchType::Regex => write!(f, "term regex"),
             TermMatchType::Exact => write!(f, "term =="),
+            TermMatchType::Wildcard => write!(f, "term wild"),
         }
     }
 }
 
-/// Filter types for ECL expressions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// History supplement profile for historical associations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum HistoryProfile {
+    /// Minimal: SAME_AS only
+    Min,
+    /// Moderate: SAME_AS, REPLACED_BY, POSSIBLY_EQUIVALENT_TO
+    Mod,
+    /// Maximum: All historical associations
+    Max,
+}
+
+impl std::fmt::Display for HistoryProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HistoryProfile::Min => write!(f, "-MIN"),
+            HistoryProfile::Mod => write!(f, "-MOD"),
+            HistoryProfile::Max => write!(f, "-MAX"),
+        }
+    }
+}
+
+/// Acceptability value for dialect filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FilterAcceptability {
+    /// Preferred term only.
+    Preferred,
+    /// Acceptable term only.
+    Acceptable,
+}
+
+/// Filter types for ECL expressions.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(clippy::derive_partial_eq_without_eq)]
 pub enum EclFilter {
+    // =========================================================================
+    // Description Filters
+    // =========================================================================
+
     /// Term filter: `{{ term = "heart" }}`
     Term {
         /// How to match the term.
         match_type: TermMatchType,
         /// The term value to match.
         value: String,
-        /// Optional language code filter.
-        language: Option<String>,
-        /// Optional description type filter.
-        type_id: Option<SctId>,
     },
-    /// Member filter: `{{ M mapTarget = "J45.9" }}`
+
+    /// Language filter: `{{ language = en }}` or `{{ language = (en es) }}`
+    Language {
+        /// Language codes (ISO 639-1).
+        codes: Vec<String>,
+    },
+
+    /// Type filter: `{{ typeId = 900000000000003001 }}` or `{{ type = syn }}`
+    DescriptionType {
+        /// Description type IDs.
+        type_ids: Vec<SctId>,
+    },
+
+    /// Dialect filter: `{{ dialect = en-US }}` or `{{ dialectId = 900000000000509007 }}`
+    Dialect {
+        /// Dialect reference set IDs.
+        dialect_ids: Vec<SctId>,
+        /// Optional acceptability constraint.
+        acceptability: Option<FilterAcceptability>,
+    },
+
+    /// Case significance filter: `{{ caseSignificance = caseInsensitive }}`
+    CaseSignificance {
+        /// Case significance ID.
+        case_significance_id: SctId,
+    },
+
+    // =========================================================================
+    // Concept Filters
+    // =========================================================================
+
+    /// Active filter: `{{ active = true }}`
+    Active(bool),
+
+    /// Module filter: `{{ moduleId = 900000000000207008 }}`
+    Module {
+        /// Module IDs to filter by.
+        module_ids: Vec<SctId>,
+    },
+
+    /// Effective time filter: `{{ effectiveTime >= 20200101 }}`
+    EffectiveTime {
+        /// Comparison operator.
+        operator: ComparisonOperator,
+        /// Date in YYYYMMDD format.
+        date: u32,
+    },
+
+    /// Definition status filter: `{{ definitionStatus = primitive }}`
+    DefinitionStatus {
+        /// True = primitive, False = defined.
+        is_primitive: bool,
+    },
+
+    /// Semantic tag filter: `{{ semanticTag = "disorder" }}`
+    SemanticTag {
+        /// Semantic tags to match.
+        tags: Vec<String>,
+    },
+
+    // =========================================================================
+    // Language Reference Set Filters
+    // =========================================================================
+
+    /// Preferred in filter: `{{ preferredIn = 900000000000509007 }}`
+    PreferredIn {
+        /// Language reference set IDs.
+        refset_ids: Vec<SctId>,
+    },
+
+    /// Acceptable in filter: `{{ acceptableIn = 900000000000509007 }}`
+    AcceptableIn {
+        /// Language reference set IDs.
+        refset_ids: Vec<SctId>,
+    },
+
+    /// Language reference set filter: `{{ languageRefSetId = 900000000000509007 }}`
+    LanguageRefSet {
+        /// Language reference set IDs (either preferred or acceptable).
+        refset_ids: Vec<SctId>,
+    },
+
+    // =========================================================================
+    // Member Filters
+    // =========================================================================
+
+    /// Member field filter: `{{ M mapTarget = "J45.9" }}`
     Member {
         /// The refset field to filter on.
         field: String,
         /// The comparison operator.
         operator: ComparisonOperator,
         /// The value to compare against.
-        value: String,
+        value: MemberFieldValue,
     },
-    /// History supplement: `{{+HISTORY}}`
-    History,
-    /// Active filter: `{{ active = true }}`
-    Active(bool),
-    /// Module filter: `{{ moduleId = ... }}`
-    Module(SctId),
+
+    // =========================================================================
+    // Other Filters
+    // =========================================================================
+
+    /// ID filter: `{{ id = 123456 }}` or `{{ id = (123 456) }}`
+    Id {
+        /// Component IDs to match.
+        ids: Vec<SctId>,
+    },
+
+    /// History supplement: `{{ +HISTORY }}` or `{{ +HISTORY-MIN }}`
+    History {
+        /// Optional profile (MIN, MOD, MAX).
+        profile: Option<HistoryProfile>,
+    },
+}
+
+/// Value types for member field filters.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MemberFieldValue {
+    /// String value.
+    String(String),
+    /// Integer value.
+    Integer(i64),
+    /// Decimal value.
+    Decimal(f64),
+    /// Boolean value.
+    Boolean(bool),
+    /// SCT ID value.
+    SctId(SctId),
+}
+
+impl Eq for MemberFieldValue {}
+
+impl std::fmt::Display for MemberFieldValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemberFieldValue::String(s) => write!(f, "\"{}\"", s),
+            MemberFieldValue::Integer(n) => write!(f, "{}", n),
+            MemberFieldValue::Decimal(n) => write!(f, "{}", n),
+            MemberFieldValue::Boolean(b) => write!(f, "{}", b),
+            MemberFieldValue::SctId(id) => write!(f, "{}", id),
+        }
+    }
+}
+
+impl std::fmt::Display for EclFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EclFilter::Term { match_type, value } => {
+                write!(f, "{} \"{}\"", match_type, value)
+            }
+            EclFilter::Language { codes } => {
+                if codes.len() == 1 {
+                    write!(f, "language = {}", codes[0])
+                } else {
+                    write!(f, "language = ({})", codes.join(" "))
+                }
+            }
+            EclFilter::DescriptionType { type_ids } => {
+                if type_ids.len() == 1 {
+                    write!(f, "typeId = {}", type_ids[0])
+                } else {
+                    let ids: Vec<String> = type_ids.iter().map(|id| id.to_string()).collect();
+                    write!(f, "typeId = ({})", ids.join(" "))
+                }
+            }
+            EclFilter::Dialect { dialect_ids, acceptability } => {
+                if dialect_ids.len() == 1 {
+                    write!(f, "dialectId = {}", dialect_ids[0])?;
+                } else {
+                    let ids: Vec<String> = dialect_ids.iter().map(|id| id.to_string()).collect();
+                    write!(f, "dialectId = ({})", ids.join(" "))?;
+                }
+                if let Some(acc) = acceptability {
+                    match acc {
+                        FilterAcceptability::Preferred => write!(f, " prefer")?,
+                        FilterAcceptability::Acceptable => write!(f, " accept")?,
+                    }
+                }
+                Ok(())
+            }
+            EclFilter::CaseSignificance { case_significance_id } => {
+                write!(f, "caseSignificanceId = {}", case_significance_id)
+            }
+            EclFilter::Active(active) => {
+                write!(f, "active = {}", active)
+            }
+            EclFilter::Module { module_ids } => {
+                if module_ids.len() == 1 {
+                    write!(f, "moduleId = {}", module_ids[0])
+                } else {
+                    let ids: Vec<String> = module_ids.iter().map(|id| id.to_string()).collect();
+                    write!(f, "moduleId = ({})", ids.join(" "))
+                }
+            }
+            EclFilter::EffectiveTime { operator, date } => {
+                write!(f, "effectiveTime {} {}", operator, date)
+            }
+            EclFilter::DefinitionStatus { is_primitive } => {
+                if *is_primitive {
+                    write!(f, "definitionStatus = primitive")
+                } else {
+                    write!(f, "definitionStatus = defined")
+                }
+            }
+            EclFilter::SemanticTag { tags } => {
+                if tags.len() == 1 {
+                    write!(f, "semanticTag = \"{}\"", tags[0])
+                } else {
+                    let quoted: Vec<String> = tags.iter().map(|t| format!("\"{}\"", t)).collect();
+                    write!(f, "semanticTag = ({})", quoted.join(" "))
+                }
+            }
+            EclFilter::PreferredIn { refset_ids } => {
+                if refset_ids.len() == 1 {
+                    write!(f, "preferredIn = {}", refset_ids[0])
+                } else {
+                    let ids: Vec<String> = refset_ids.iter().map(|id| id.to_string()).collect();
+                    write!(f, "preferredIn = ({})", ids.join(" "))
+                }
+            }
+            EclFilter::AcceptableIn { refset_ids } => {
+                if refset_ids.len() == 1 {
+                    write!(f, "acceptableIn = {}", refset_ids[0])
+                } else {
+                    let ids: Vec<String> = refset_ids.iter().map(|id| id.to_string()).collect();
+                    write!(f, "acceptableIn = ({})", ids.join(" "))
+                }
+            }
+            EclFilter::LanguageRefSet { refset_ids } => {
+                if refset_ids.len() == 1 {
+                    write!(f, "languageRefSetId = {}", refset_ids[0])
+                } else {
+                    let ids: Vec<String> = refset_ids.iter().map(|id| id.to_string()).collect();
+                    write!(f, "languageRefSetId = ({})", ids.join(" "))
+                }
+            }
+            EclFilter::Member { field, operator, value } => {
+                write!(f, "M {} {} {}", field, operator, value)
+            }
+            EclFilter::Id { ids } => {
+                if ids.len() == 1 {
+                    write!(f, "id = {}", ids[0])
+                } else {
+                    let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+                    write!(f, "id = ({})", id_strs.join(" "))
+                }
+            }
+            EclFilter::History { profile } => {
+                write!(f, "+HISTORY")?;
+                if let Some(p) = profile {
+                    write!(f, "{}", p)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Abstract Syntax Tree for ECL expressions.
@@ -312,7 +591,7 @@ pub enum EclFilter {
 /// let expr = parse("<< 404684003").unwrap();
 /// assert!(matches!(expr, EclExpression::DescendantOrSelfOf(_)));
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EclExpression {
     /// A single concept reference (self).
@@ -602,17 +881,7 @@ impl std::fmt::Display for EclExpression {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    match filter {
-                        EclFilter::Term { match_type, value, .. } => {
-                            write!(f, "{} \"{}\"", match_type, value)?;
-                        }
-                        EclFilter::Member { field, operator, value } => {
-                            write!(f, "M {} {} \"{}\"", field, operator, value)?;
-                        }
-                        EclFilter::History => write!(f, "+HISTORY")?,
-                        EclFilter::Active(b) => write!(f, "active = {}", b)?,
-                        EclFilter::Module(id) => write!(f, "moduleId = {}", id)?,
-                    }
+                    write!(f, "{}", filter)?;
                 }
                 write!(f, " }}}}")
             }

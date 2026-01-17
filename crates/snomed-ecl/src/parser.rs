@@ -15,7 +15,8 @@ use nom::{
 
 use crate::ast::{
     AttributeConstraint, AttributeGroup, Cardinality, ComparisonOperator, ConcreteValue,
-    EclExpression, EclFilter, Refinement, RefinementOperator, TermMatchType,
+    EclExpression, EclFilter, FilterAcceptability, HistoryProfile, MemberFieldValue,
+    Refinement, RefinementOperator, TermMatchType,
 };
 use crate::error::{EclError, EclResult};
 use crate::SctId;
@@ -568,7 +569,7 @@ fn quoted_string(input: &str) -> IResult<&str, String> {
     Ok((input, content.to_string()))
 }
 
-/// Parse a term filter: `term = "value"` or `term startsWith "value"`
+/// Parse a term filter: `term = "value"` or `term startsWith "value"` or `term wild "diab*"`
 fn term_filter(input: &str) -> IResult<&str, EclFilter> {
     let (input, _) = tag_no_case("term")(input)?;
     let (input, _) = ws(input)?;
@@ -576,22 +577,54 @@ fn term_filter(input: &str) -> IResult<&str, EclFilter> {
     let (input, match_type) = alt((
         value(TermMatchType::StartsWith, tag_no_case("startsWith")),
         value(TermMatchType::Regex, tag_no_case("regex")),
+        value(TermMatchType::Wildcard, tag_no_case("wild")),
         value(TermMatchType::Exact, tag("==")),
         value(TermMatchType::Contains, char('=')),
     ))(input)?;
 
     let (input, _) = ws(input)?;
-    let (input, value) = quoted_string(input)?;
+    let (input, term_value) = quoted_string(input)?;
 
     Ok((
         input,
         EclFilter::Term {
             match_type,
-            value,
-            language: None,
-            type_id: None,
+            value: term_value,
         },
     ))
+}
+
+/// Parse a member field value: string, integer, decimal, boolean, or sctid
+fn member_field_value(input: &str) -> IResult<&str, MemberFieldValue> {
+    alt((
+        // Boolean values
+        map(tag_no_case("true"), |_| MemberFieldValue::Boolean(true)),
+        map(tag_no_case("false"), |_| MemberFieldValue::Boolean(false)),
+        // Quoted string
+        map(quoted_string, MemberFieldValue::String),
+        // Numbers (try decimal first, then integer, then sctid)
+        map(
+            recognize(tuple((
+                opt(char('-')),
+                digit1,
+                char('.'),
+                digit1,
+            ))),
+            |s: &str| MemberFieldValue::Decimal(s.parse().unwrap_or(0.0)),
+        ),
+        map(
+            recognize(tuple((opt(char('-')), digit1))),
+            |s: &str| {
+                let n: i64 = s.parse().unwrap_or(0);
+                // If it looks like an SCTID (positive, > 10 digits typically), treat as SctId
+                if n > 0 && s.len() >= 6 {
+                    MemberFieldValue::SctId(n as SctId)
+                } else {
+                    MemberFieldValue::Integer(n)
+                }
+            },
+        ),
+    ))(input)
 }
 
 /// Parse a member filter: `M fieldName = "value"`
@@ -602,23 +635,31 @@ fn member_filter(input: &str) -> IResult<&str, EclFilter> {
     let (input, _) = ws(input)?;
     let (input, operator) = comparison_operator(input)?;
     let (input, _) = ws(input)?;
-    let (input, value) = quoted_string(input)?;
+    let (input, field_value) = member_field_value(input)?;
 
     Ok((
         input,
         EclFilter::Member {
             field: field.to_string(),
             operator,
-            value,
+            value: field_value,
         },
     ))
 }
 
-/// Parse a history supplement filter: `+HISTORY`
+/// Parse a history supplement filter: `+HISTORY` or `+HISTORY-MIN` or `+HISTORY-MOD` or `+HISTORY-MAX`
 fn history_filter(input: &str) -> IResult<&str, EclFilter> {
     let (input, _) = tag("+")(input)?;
     let (input, _) = tag_no_case("HISTORY")(input)?;
-    Ok((input, EclFilter::History))
+
+    // Optionally parse profile suffix
+    let (input, profile) = opt(alt((
+        value(HistoryProfile::Min, tag_no_case("-MIN")),
+        value(HistoryProfile::Mod, tag_no_case("-MOD")),
+        value(HistoryProfile::Max, tag_no_case("-MAX")),
+    )))(input)?;
+
+    Ok((input, EclFilter::History { profile }))
 }
 
 /// Parse an active filter: `active = true/false`
@@ -637,25 +678,363 @@ fn active_filter(input: &str) -> IResult<&str, EclFilter> {
     Ok((input, EclFilter::Active(active)))
 }
 
-/// Parse a module filter: `moduleId = 900000000000207008`
+/// Parse a module filter: `moduleId = 900000000000207008` or `moduleId = (id1 id2)`
 fn module_filter(input: &str) -> IResult<&str, EclFilter> {
     let (input, _) = tag_no_case("moduleId")(input)?;
     let (input, _) = ws(input)?;
     let (input, _) = char('=')(input)?;
     let (input, _) = ws(input)?;
-    let (input, id) = sct_id(input)?;
 
-    Ok((input, EclFilter::Module(id)))
+    // Support single ID or multiple IDs in parentheses
+    let (input, module_ids) = alt((
+        // Multiple IDs: (id1 id2 id3)
+        delimited(
+            preceded(ws, char('(')),
+            separated_list1(multispace1, sct_id),
+            preceded(ws, char(')')),
+        ),
+        // Single ID
+        map(sct_id, |id| vec![id]),
+    ))(input)?;
+
+    Ok((input, EclFilter::Module { module_ids }))
+}
+
+/// Parse a language code (2-3 letter code)
+fn language_code(input: &str) -> IResult<&str, String> {
+    map(
+        take_while1(|c: char| c.is_ascii_alphabetic()),
+        |s: &str| s.to_lowercase(),
+    )(input)
+}
+
+/// Parse a language filter: `language = en` or `language = (en es fr)`
+fn language_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("language")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    let (input, codes) = alt((
+        // Multiple codes: (en es fr)
+        delimited(
+            preceded(ws, char('(')),
+            separated_list1(multispace1, language_code),
+            preceded(ws, char(')')),
+        ),
+        // Single code
+        map(language_code, |s| vec![s]),
+    ))(input)?;
+
+    Ok((input, EclFilter::Language { codes }))
+}
+
+/// Known description type IDs
+const FSN_ID: SctId = 900000000000003001;
+const SYN_ID: SctId = 900000000000013009;
+const DEF_ID: SctId = 900000000000550004;
+
+/// Parse a description type alias (fsn, syn, def)
+fn description_type_alias(input: &str) -> IResult<&str, SctId> {
+    alt((
+        value(FSN_ID, tag_no_case("fsn")),
+        value(SYN_ID, tag_no_case("syn")),
+        value(DEF_ID, tag_no_case("def")),
+    ))(input)
+}
+
+/// Parse a description type filter: `typeId = 900000000000003001` or `type = syn`
+fn description_type_filter(input: &str) -> IResult<&str, EclFilter> {
+    // First try typeId with numeric IDs
+    let type_id_parser = |input| {
+        let (input, _) = tag_no_case("typeId")(input)?;
+        let (input, _) = ws(input)?;
+        let (input, _) = char('=')(input)?;
+        let (input, _) = ws(input)?;
+
+        let (input, type_ids) = alt((
+            delimited(
+                preceded(ws, char('(')),
+                separated_list1(multispace1, sct_id),
+                preceded(ws, char(')')),
+            ),
+            map(sct_id, |id| vec![id]),
+        ))(input)?;
+
+        Ok((input, EclFilter::DescriptionType { type_ids }))
+    };
+
+    // Then try type with aliases
+    let type_alias_parser = |input| {
+        let (input, _) = tag_no_case("type")(input)?;
+        let (input, _) = ws(input)?;
+        let (input, _) = char('=')(input)?;
+        let (input, _) = ws(input)?;
+
+        let (input, type_ids) = alt((
+            delimited(
+                preceded(ws, char('(')),
+                separated_list1(multispace1, description_type_alias),
+                preceded(ws, char(')')),
+            ),
+            map(description_type_alias, |id| vec![id]),
+        ))(input)?;
+
+        Ok((input, EclFilter::DescriptionType { type_ids }))
+    };
+
+    alt((type_id_parser, type_alias_parser))(input)
+}
+
+/// Known dialect refset IDs
+const US_DIALECT: SctId = 900000000000509007;
+const GB_DIALECT: SctId = 900000000000508004;
+
+/// Parse a dialect alias (en-US, en-GB)
+fn dialect_alias(input: &str) -> IResult<&str, SctId> {
+    alt((
+        value(US_DIALECT, tag_no_case("en-US")),
+        value(US_DIALECT, tag_no_case("en-us")),
+        value(GB_DIALECT, tag_no_case("en-GB")),
+        value(GB_DIALECT, tag_no_case("en-gb")),
+    ))(input)
+}
+
+/// Parse acceptability for dialect filters
+fn filter_acceptability(input: &str) -> IResult<&str, FilterAcceptability> {
+    alt((
+        value(FilterAcceptability::Preferred, tag_no_case("prefer")),
+        value(FilterAcceptability::Acceptable, tag_no_case("accept")),
+    ))(input)
+}
+
+/// Parse a dialect filter: `dialectId = 900000000000509007` or `dialect = en-US`
+fn dialect_filter(input: &str) -> IResult<&str, EclFilter> {
+    // dialectId variant
+    let dialect_id_parser = |input| {
+        let (input, _) = tag_no_case("dialectId")(input)?;
+        let (input, _) = ws(input)?;
+        let (input, _) = char('=')(input)?;
+        let (input, _) = ws(input)?;
+
+        let (input, dialect_ids) = alt((
+            delimited(
+                preceded(ws, char('(')),
+                separated_list1(multispace1, sct_id),
+                preceded(ws, char(')')),
+            ),
+            map(sct_id, |id| vec![id]),
+        ))(input)?;
+
+        // Optional acceptability
+        let (input, acceptability) = opt(preceded(ws, filter_acceptability))(input)?;
+
+        Ok((input, EclFilter::Dialect { dialect_ids, acceptability }))
+    };
+
+    // dialect alias variant
+    let dialect_alias_parser = |input| {
+        let (input, _) = tag_no_case("dialect")(input)?;
+        let (input, _) = ws(input)?;
+        let (input, _) = char('=')(input)?;
+        let (input, _) = ws(input)?;
+
+        let (input, dialect_ids) = alt((
+            delimited(
+                preceded(ws, char('(')),
+                separated_list1(multispace1, dialect_alias),
+                preceded(ws, char(')')),
+            ),
+            map(dialect_alias, |id| vec![id]),
+        ))(input)?;
+
+        let (input, acceptability) = opt(preceded(ws, filter_acceptability))(input)?;
+
+        Ok((input, EclFilter::Dialect { dialect_ids, acceptability }))
+    };
+
+    alt((dialect_id_parser, dialect_alias_parser))(input)
+}
+
+/// Parse a definition status filter: `definitionStatus = primitive` or `definitionStatus = defined`
+fn definition_status_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("definitionStatus")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    let (input, is_primitive) = alt((
+        value(true, tag_no_case("primitive")),
+        value(false, tag_no_case("defined")),
+        value(false, tag_no_case("sufficiently defined")),
+        // Also support IDs
+        value(true, tag("900000000000074008")),  // Primitive
+        value(false, tag("900000000000073002")), // Defined
+    ))(input)?;
+
+    Ok((input, EclFilter::DefinitionStatus { is_primitive }))
+}
+
+/// Parse a semantic tag filter: `semanticTag = "disorder"` or `semanticTag = ("disorder" "finding")`
+fn semantic_tag_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("semanticTag")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    let (input, tags) = alt((
+        // Multiple tags: ("disorder" "finding")
+        delimited(
+            preceded(ws, char('(')),
+            separated_list1(multispace1, quoted_string),
+            preceded(ws, char(')')),
+        ),
+        // Single tag
+        map(quoted_string, |s| vec![s]),
+    ))(input)?;
+
+    Ok((input, EclFilter::SemanticTag { tags }))
+}
+
+/// Parse an effective time filter: `effectiveTime >= 20200101`
+fn effective_time_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("effectiveTime")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, operator) = comparison_operator(input)?;
+    let (input, _) = ws(input)?;
+
+    // Parse YYYYMMDD date
+    let (input, date_str) = take_while1(|c: char| c.is_ascii_digit())(input)?;
+    let date: u32 = date_str.parse().unwrap_or(0);
+
+    Ok((input, EclFilter::EffectiveTime { operator, date }))
+}
+
+/// Parse a preferredIn filter: `preferredIn = 900000000000509007`
+fn preferred_in_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("preferredIn")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    let (input, refset_ids) = alt((
+        delimited(
+            preceded(ws, char('(')),
+            separated_list1(multispace1, sct_id),
+            preceded(ws, char(')')),
+        ),
+        map(sct_id, |id| vec![id]),
+    ))(input)?;
+
+    Ok((input, EclFilter::PreferredIn { refset_ids }))
+}
+
+/// Parse an acceptableIn filter: `acceptableIn = 900000000000509007`
+fn acceptable_in_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("acceptableIn")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    let (input, refset_ids) = alt((
+        delimited(
+            preceded(ws, char('(')),
+            separated_list1(multispace1, sct_id),
+            preceded(ws, char(')')),
+        ),
+        map(sct_id, |id| vec![id]),
+    ))(input)?;
+
+    Ok((input, EclFilter::AcceptableIn { refset_ids }))
+}
+
+/// Parse a language reference set filter: `languageRefSetId = 900000000000509007`
+fn language_refset_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("languageRefSetId")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    let (input, refset_ids) = alt((
+        delimited(
+            preceded(ws, char('(')),
+            separated_list1(multispace1, sct_id),
+            preceded(ws, char(')')),
+        ),
+        map(sct_id, |id| vec![id]),
+    ))(input)?;
+
+    Ok((input, EclFilter::LanguageRefSet { refset_ids }))
+}
+
+/// Parse a case significance filter: `caseSignificance = caseInsensitive`
+fn case_significance_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("caseSignificance")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    // Known case significance IDs
+    const CASE_INSENSITIVE: SctId = 900000000000448009;
+    const CASE_SENSITIVE_INITIAL: SctId = 900000000000017005;
+    const CASE_SENSITIVE_ENTIRE: SctId = 900000000000020002;
+
+    let (input, case_significance_id) = alt((
+        // Keywords
+        value(CASE_INSENSITIVE, tag_no_case("caseInsensitive")),
+        value(CASE_INSENSITIVE, tag_no_case("ci")),
+        value(CASE_SENSITIVE_INITIAL, tag_no_case("initialCharacterCaseSensitive")),
+        value(CASE_SENSITIVE_INITIAL, tag_no_case("cI")),
+        value(CASE_SENSITIVE_ENTIRE, tag_no_case("entireTermCaseSensitive")),
+        value(CASE_SENSITIVE_ENTIRE, tag_no_case("CS")),
+        // Or direct IDs
+        sct_id,
+    ))(input)?;
+
+    Ok((input, EclFilter::CaseSignificance { case_significance_id }))
+}
+
+/// Parse an ID filter: `id = 123456` or `id = (123 456 789)`
+fn id_filter(input: &str) -> IResult<&str, EclFilter> {
+    let (input, _) = tag_no_case("id")(input)?;
+    let (input, _) = ws(input)?;
+    let (input, _) = char('=')(input)?;
+    let (input, _) = ws(input)?;
+
+    let (input, ids) = alt((
+        delimited(
+            preceded(ws, char('(')),
+            separated_list1(multispace1, sct_id),
+            preceded(ws, char(')')),
+        ),
+        map(sct_id, |id| vec![id]),
+    ))(input)?;
+
+    Ok((input, EclFilter::Id { ids }))
 }
 
 /// Parse a single filter.
 fn single_filter(input: &str) -> IResult<&str, EclFilter> {
     alt((
+        // History first (starts with +)
         history_filter,
+        // Member filter (starts with M)
         member_filter,
-        term_filter,
-        active_filter,
-        module_filter,
+        // Longer keywords first to avoid partial matches
+        language_refset_filter,    // languageRefSetId
+        definition_status_filter,  // definitionStatus
+        case_significance_filter,  // caseSignificance
+        effective_time_filter,     // effectiveTime
+        semantic_tag_filter,       // semanticTag
+        preferred_in_filter,       // preferredIn
+        acceptable_in_filter,      // acceptableIn
+        description_type_filter,   // typeId, type
+        dialect_filter,            // dialectId, dialect
+        language_filter,           // language
+        module_filter,             // moduleId
+        active_filter,             // active
+        term_filter,               // term
+        id_filter,                 // id (short keyword last)
     ))(input)
 }
 
@@ -1804,7 +2183,22 @@ mod tests {
                 let expr = parse("< 404684003 {{ +HISTORY }}").unwrap();
                 match expr {
                     EclExpression::Filtered { filters, .. } => {
-                        assert!(matches!(&filters[0], EclFilter::History));
+                        assert!(matches!(&filters[0], EclFilter::History { profile: None }));
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: History supplement with profile
+            #[test]
+            fn test_history_supplement_with_profile() {
+                let expr = parse("< 404684003 {{ +HISTORY-MIN }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        assert!(matches!(
+                            &filters[0],
+                            EclFilter::History { profile: Some(HistoryProfile::Min) }
+                        ));
                     }
                     _ => panic!("Expected Filtered expression"),
                 }
@@ -1820,10 +2214,334 @@ mod tests {
                             EclFilter::Member { field, operator, value } => {
                                 assert_eq!(field, "mapTarget");
                                 assert!(matches!(operator, ComparisonOperator::Equal));
-                                assert_eq!(value, "J45.9");
+                                assert!(matches!(value, MemberFieldValue::String(s) if s == "J45.9"));
                             }
                             _ => panic!("Expected Member filter"),
                         }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Language filter with single code
+            #[test]
+            fn test_language_filter_single() {
+                let expr = parse("<< 404684003 {{ language = en }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Language { codes } => {
+                                assert_eq!(codes, &vec!["en".to_string()]);
+                            }
+                            _ => panic!("Expected Language filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Language filter with multiple codes
+            #[test]
+            fn test_language_filter_multiple() {
+                let expr = parse("<< 404684003 {{ language = (en es fr) }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Language { codes } => {
+                                assert_eq!(codes, &vec!["en".to_string(), "es".to_string(), "fr".to_string()]);
+                            }
+                            _ => panic!("Expected Language filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Description type filter with ID
+            #[test]
+            fn test_description_type_filter_id() {
+                let expr = parse("<< 404684003 {{ typeId = 900000000000003001 }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::DescriptionType { type_ids } => {
+                                assert_eq!(type_ids, &vec![900000000000003001u64]);
+                            }
+                            _ => panic!("Expected DescriptionType filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Description type filter with alias
+            #[test]
+            fn test_description_type_filter_alias() {
+                let expr = parse("<< 404684003 {{ type = syn }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::DescriptionType { type_ids } => {
+                                assert_eq!(type_ids, &vec![900000000000013009u64]); // SYN_ID
+                            }
+                            _ => panic!("Expected DescriptionType filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Dialect filter with ID
+            #[test]
+            fn test_dialect_filter_id() {
+                let expr = parse("<< 404684003 {{ dialectId = 900000000000509007 }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Dialect { dialect_ids, acceptability } => {
+                                assert_eq!(dialect_ids, &vec![900000000000509007u64]);
+                                assert!(acceptability.is_none());
+                            }
+                            _ => panic!("Expected Dialect filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Dialect filter with alias and acceptability
+            #[test]
+            fn test_dialect_filter_alias_with_acceptability() {
+                let expr = parse("<< 404684003 {{ dialect = en-US prefer }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Dialect { dialect_ids, acceptability } => {
+                                assert_eq!(dialect_ids, &vec![900000000000509007u64]);
+                                assert!(matches!(acceptability, Some(FilterAcceptability::Preferred)));
+                            }
+                            _ => panic!("Expected Dialect filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Definition status filter - primitive
+            #[test]
+            fn test_definition_status_filter_primitive() {
+                let expr = parse("<< 404684003 {{ definitionStatus = primitive }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::DefinitionStatus { is_primitive } => {
+                                assert!(*is_primitive);
+                            }
+                            _ => panic!("Expected DefinitionStatus filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Definition status filter - defined
+            #[test]
+            fn test_definition_status_filter_defined() {
+                let expr = parse("<< 404684003 {{ definitionStatus = defined }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::DefinitionStatus { is_primitive } => {
+                                assert!(!*is_primitive);
+                            }
+                            _ => panic!("Expected DefinitionStatus filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Semantic tag filter
+            #[test]
+            fn test_semantic_tag_filter() {
+                let expr = parse(r#"<< 404684003 {{ semanticTag = "disorder" }}"#).unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::SemanticTag { tags } => {
+                                assert_eq!(tags, &vec!["disorder".to_string()]);
+                            }
+                            _ => panic!("Expected SemanticTag filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Effective time filter
+            #[test]
+            fn test_effective_time_filter() {
+                let expr = parse("<< 404684003 {{ effectiveTime >= 20200101 }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::EffectiveTime { operator, date } => {
+                                assert!(matches!(operator, ComparisonOperator::GreaterThanOrEqual));
+                                assert_eq!(*date, 20200101);
+                            }
+                            _ => panic!("Expected EffectiveTime filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Preferred in filter
+            #[test]
+            fn test_preferred_in_filter() {
+                let expr = parse("<< 404684003 {{ preferredIn = 900000000000509007 }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::PreferredIn { refset_ids } => {
+                                assert_eq!(refset_ids, &vec![900000000000509007u64]);
+                            }
+                            _ => panic!("Expected PreferredIn filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Acceptable in filter
+            #[test]
+            fn test_acceptable_in_filter() {
+                let expr = parse("<< 404684003 {{ acceptableIn = 900000000000509007 }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::AcceptableIn { refset_ids } => {
+                                assert_eq!(refset_ids, &vec![900000000000509007u64]);
+                            }
+                            _ => panic!("Expected AcceptableIn filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Language reference set filter
+            #[test]
+            fn test_language_refset_filter() {
+                let expr = parse("<< 404684003 {{ languageRefSetId = 900000000000509007 }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::LanguageRefSet { refset_ids } => {
+                                assert_eq!(refset_ids, &vec![900000000000509007u64]);
+                            }
+                            _ => panic!("Expected LanguageRefSet filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Case significance filter
+            #[test]
+            fn test_case_significance_filter() {
+                let expr = parse("<< 404684003 {{ caseSignificance = caseInsensitive }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::CaseSignificance { case_significance_id } => {
+                                assert_eq!(*case_significance_id, 900000000000448009u64);
+                            }
+                            _ => panic!("Expected CaseSignificance filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: ID filter single
+            #[test]
+            fn test_id_filter_single() {
+                let expr = parse("<< 404684003 {{ id = 123456 }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Id { ids } => {
+                                assert_eq!(ids, &vec![123456u64]);
+                            }
+                            _ => panic!("Expected Id filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: ID filter multiple
+            #[test]
+            fn test_id_filter_multiple() {
+                let expr = parse("<< 404684003 {{ id = (123 456 789) }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Id { ids } => {
+                                assert_eq!(ids, &vec![123u64, 456u64, 789u64]);
+                            }
+                            _ => panic!("Expected Id filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Module filter with multiple IDs
+            #[test]
+            fn test_module_filter_multiple() {
+                let expr = parse("<< 404684003 {{ moduleId = (900000000000207008 900000000000012004) }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Module { module_ids } => {
+                                assert_eq!(module_ids, &vec![900000000000207008u64, 900000000000012004u64]);
+                            }
+                            _ => panic!("Expected Module filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Wildcard term filter
+            #[test]
+            fn test_term_wildcard_filter() {
+                let expr = parse(r#"<< 404684003 {{ term wild "diab*" }}"#).unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::Term { match_type, value } => {
+                                assert!(matches!(match_type, TermMatchType::Wildcard));
+                                assert_eq!(value, "diab*");
+                            }
+                            _ => panic!("Expected Term filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Multiple filters combined
+            #[test]
+            fn test_multiple_filters() {
+                let expr = parse(r#"<< 404684003 {{ term = "heart", active = true }}"#).unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        assert_eq!(filters.len(), 2);
+                        assert!(matches!(&filters[0], EclFilter::Term { .. }));
+                        assert!(matches!(&filters[1], EclFilter::Active(true)));
                     }
                     _ => panic!("Expected Filtered expression"),
                 }
