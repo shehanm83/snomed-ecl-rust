@@ -14,7 +14,7 @@ This workspace provides three independent crates that can be used separately or 
 
 ```
 ┌─────────────────────────┐
-│      snomed-ecl         │  ← Parser only (like b2ihealthcare/IHTSDO)
+│      snomed-ecl         │  ← Parser only
 │   ECL String → AST      │
 └───────────┬─────────────┘
             │ optional
@@ -184,17 +184,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 See [docs/ECL_COMPLIANCE_GAPS.md](docs/ECL_COMPLIANCE_GAPS.md) for detailed gap analysis.
 
-## Comparison with Other Implementations
-
-| Feature | snomed-ecl-rust | b2ihealthcare/snomed-ecl | IHTSDO/snomed-ecl-parser |
-|---------|-----------------|--------------------------|--------------------------|
-| Language | Rust | Java (Xtext) | Java (ANTLR4) |
-| Parser | Yes | Yes | Yes |
-| Executor | Yes (optional) | No* | No* |
-| Optimizations | Yes (optional) | No* | No* |
-
-*Execution in b2ihealthcare/IHTSDO is handled by their terminology servers (Snow Owl, Snowstorm) using Elasticsearch.
-
 ## License
 
 Apache-2.0
@@ -202,5 +191,4 @@ Apache-2.0
 ## References
 
 - [ECL Specification](https://docs.snomed.org/snomed-ct-specifications/snomed-ct-expression-constraint-language)
-- [b2ihealthcare/snomed-ecl](https://github.com/b2ihealthcare/snomed-ecl)
-- [IHTSDO/snomed-ecl-parser](https://github.com/IHTSDO/snomed-ecl-parser)
+- [SNOMED CT Expression Constraint Language](https://confluence.ihtsdotools.org/display/DOCECL)

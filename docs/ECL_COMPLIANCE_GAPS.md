@@ -4,10 +4,6 @@ This document details all gaps between the current `snomed-ecl-rust` implementat
 
 **Reference:** [Official ECL Specification](https://docs.snomed.org/snomed-ct-specifications/snomed-ct-expression-constraint-language)
 
-**Comparison implementations:**
-- [b2ihealthcare/snomed-ecl](https://github.com/b2ihealthcare/snomed-ecl) (Xtext/Java, ECL 2.2)
-- [IHTSDO/snomed-ecl-parser](https://github.com/IHTSDO/snomed-ecl-parser) (ANTLR4/Java, ECL 2.1)
-
 ---
 
 ## Table of Contents
@@ -932,6 +928,4 @@ mod language_filter_tests {
 ## References
 
 - [ECL Specification (SNOMED International)](https://docs.snomed.org/snomed-ct-specifications/snomed-ct-expression-constraint-language)
-- [b2ihealthcare ECL Grammar (Xtext)](https://github.com/b2ihealthcare/snomed-ecl/blob/main/com.b2international.snomed.ecl/src/com/b2international/snomed/ecl/Ecl.xtext)
-- [IHTSDO ECL Parser (ANTLR4)](https://github.com/IHTSDO/snomed-ecl-parser)
 - [ECL Quick Reference](https://confluence.ihtsdotools.org/display/DOCECL/Appendix+D+-+ECL+Quick+Reference)

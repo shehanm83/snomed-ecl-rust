@@ -403,14 +403,14 @@ impl QueryPlanner {
                 (result_estimate, total_cost)
             }
 
-            EclExpression::MemberOf { refset_id, .. } => {
+            EclExpression::MemberOf { refset } => {
                 // Reference sets have variable size; use a conservative estimate
                 let estimate = heuristics::DEFAULT_DESCENDANT_ESTIMATE;
                 let cost = self.statistics.cost_lookup();
 
                 plan.add_step(QueryStep::new(
                     "MemberOf",
-                    format!("^ {}", refset_id),
+                    format!("^ ({})", refset),
                     estimate,
                     cost,
                 ));
@@ -428,6 +428,21 @@ impl QueryPlanner {
                     "Wildcard (*) query returns all concepts - consider adding constraints"
                         .to_string(),
                 );
+
+                (estimate, cost)
+            }
+
+            EclExpression::AlternateIdentifier { scheme, identifier } => {
+                // Alternate identifier resolves to a single concept (or none)
+                let estimate = 1;
+                let cost = self.statistics.cost_lookup();
+
+                plan.add_step(QueryStep::new(
+                    "AlternateId",
+                    format!("{}#{}", scheme, identifier),
+                    estimate,
+                    cost,
+                ));
 
                 (estimate, cost)
             }
@@ -503,6 +518,20 @@ impl QueryPlanner {
                 plan.add_step(QueryStep::new("BottomOfSet", "!!<", estimate, cost));
 
                 (estimate, inner_cost + cost)
+            }
+
+            EclExpression::ConceptSet(ids) => {
+                let estimate = ids.len();
+                let cost = self.statistics.cost_lookup() * ids.len() as f64;
+
+                plan.add_step(QueryStep::new(
+                    "ConceptSet",
+                    format!("({} concepts)", ids.len()),
+                    estimate,
+                    cost,
+                ));
+
+                (estimate, cost)
             }
         }
     }
@@ -600,7 +629,10 @@ impl QueryPlanner {
                 self.count_concept_refs(left, counts);
                 self.count_concept_refs(right, counts);
             }
-            EclExpression::MemberOf { .. } | EclExpression::Any | EclExpression::Nested(_) => {}
+            EclExpression::MemberOf { .. }
+            | EclExpression::Any
+            | EclExpression::AlternateIdentifier { .. }
+            | EclExpression::Nested(_) => {}
 
             // Advanced ECL features
             EclExpression::Refined { focus, .. } => {
@@ -619,6 +651,11 @@ impl QueryPlanner {
             }
             EclExpression::TopOfSet(inner) | EclExpression::BottomOfSet(inner) => {
                 self.count_concept_refs(inner, counts);
+            }
+            EclExpression::ConceptSet(ids) => {
+                for id in ids {
+                    *counts.entry(*id).or_insert(0) += 1;
+                }
             }
         }
     }
@@ -680,6 +717,7 @@ impl QueryPlanner {
             }
             EclExpression::MemberOf { .. } => heuristics::DEFAULT_DESCENDANT_ESTIMATE,
             EclExpression::Any => 500_000,
+            EclExpression::AlternateIdentifier { .. } => 1,
             EclExpression::Nested(_) => unreachable!("Nested expressions are unwrapped"),
 
             // Advanced ECL features
@@ -701,6 +739,7 @@ impl QueryPlanner {
                 let inner_est = self.estimate_cardinality(inner);
                 (inner_est as f64 * 0.3).max(1.0) as usize
             }
+            EclExpression::ConceptSet(ids) => ids.len(),
         }
     }
 }
