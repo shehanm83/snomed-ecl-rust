@@ -8,15 +8,15 @@ use nom::{
     bytes::complete::{tag, tag_no_case, take_until, take_while, take_while1},
     character::complete::{char, digit1, multispace0, multispace1},
     combinator::{all_consuming, map, opt, recognize, value},
-    multi::separated_list1,
+    multi::{many0, separated_list1},
     sequence::{delimited, pair, preceded, tuple},
     IResult,
 };
 
 use crate::ast::{
     AttributeConstraint, AttributeGroup, Cardinality, ComparisonOperator, ConcreteValue,
-    EclExpression, EclFilter, FilterAcceptability, HistoryProfile, MemberFieldValue,
-    Refinement, RefinementOperator, TermMatchType,
+    EclExpression, EclFilter, FilterAcceptability, FilterDomain, HistoryProfile,
+    MemberFieldValue, Refinement, RefinementOperator, TermMatchType,
 };
 use crate::error::{EclError, EclResult};
 use crate::SctId;
@@ -143,6 +143,34 @@ fn minus_keyword(input: &str) -> IResult<&str, &str> {
 // Sub-expression constraint
 // ============================================================================
 
+/// Parse a concept reference set: `(123456 789012 345678)`
+/// A list of SCTIDs separated by whitespace, enclosed in parentheses.
+fn concept_reference_set(input: &str) -> IResult<&str, EclExpression> {
+    let (input, _) = char('(')(input)?;
+    let (input, _) = ws(input)?;
+
+    // Parse the first ID to verify this is a concept set, not a nested expression
+    let (input, first_id) = sct_id(input)?;
+    let (input, _) = ws(input)?;
+
+    // Try to parse more IDs separated by whitespace
+    let (input, mut ids) = many0(preceded(multispace1, sct_id))(input)?;
+    ids.insert(0, first_id);
+
+    // Must have at least 2 IDs to be a concept set, otherwise it's ambiguous with nested
+    if ids.len() < 2 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+
+    let (input, _) = ws(input)?;
+    let (input, _) = char(')')(input)?;
+
+    Ok((input, EclExpression::ConceptSet(ids)))
+}
+
 /// Parse a base sub-expression (without dot notation or filters).
 /// This is used internally by constraint_expression to avoid infinite recursion.
 fn base_sub_expression(input: &str) -> IResult<&str, EclExpression> {
@@ -150,6 +178,8 @@ fn base_sub_expression(input: &str) -> IResult<&str, EclExpression> {
         // Top/bottom of set operators (must come first - longer prefix)
         top_of_set,
         bottom_of_set,
+        // Concept reference set: (id1 id2 id3) - must come before nested expression
+        concept_reference_set,
         // Parenthesized expression
         map(
             delimited(
@@ -228,18 +258,32 @@ fn constraint_operator(input: &str) -> IResult<&str, ConstraintOp> {
 fn member_of_expression(input: &str) -> IResult<&str, EclExpression> {
     let (input, _) = char('^')(input)?;
     let (input, _) = ws(input)?;
+
+    // Try to parse nested expression first: `^ (expression)`
+    let mut nested = delimited(
+        pair(char('('), ws),
+        compound_or_simple_expression,
+        pair(ws, char(')')),
+    );
+
+    if let Ok((remaining, inner)) = nested(input) {
+        return Ok((
+            remaining,
+            EclExpression::MemberOf {
+                refset: Box::new(inner),
+            },
+        ));
+    }
+
+    // Fall back to simple concept reference
     let (input, inner) = focus_concept(input)?;
 
-    // Extract the concept info for memberOf
-    match inner {
-        EclExpression::ConceptReference { concept_id, term } => {
-            Ok((input, EclExpression::MemberOf { refset_id: concept_id, term }))
-        }
-        _ => {
-            // If not a simple concept, we wrap it
-            Ok((input, EclExpression::MemberOf { refset_id: 0, term: None }))
-        }
-    }
+    Ok((
+        input,
+        EclExpression::MemberOf {
+            refset: Box::new(inner),
+        },
+    ))
 }
 
 // ============================================================================
@@ -249,6 +293,7 @@ fn member_of_expression(input: &str) -> IResult<&str, EclExpression> {
 fn focus_concept(input: &str) -> IResult<&str, EclExpression> {
     alt((
         wildcard,
+        alternate_identifier,
         concept_reference,
     ))(input)
 }
@@ -268,6 +313,82 @@ fn concept_reference(input: &str) -> IResult<&str, EclExpression> {
             term,
         },
     ))
+}
+
+/// Parse an alternate identifier.
+/// Syntax: `scheme#identifier` where scheme is a URI
+/// Example: `http://snomed.info/id/73211009`
+/// Example: `http://snomed.info/sct#73211009`
+fn alternate_identifier(input: &str) -> IResult<&str, EclExpression> {
+    // Parse the scheme (URI prefix up to # or the last /)
+    // Format 1: http://snomed.info/sct#73211009 (fragment)
+    // Format 2: http://snomed.info/id/73211009 (path)
+
+    // Must start with a letter (for http, https, urn, etc.)
+    if input.is_empty() || !input.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Alpha,
+        )));
+    }
+
+    // Look for # delimiter first (fragment identifier)
+    if let Some(hash_pos) = input.find('#') {
+        let scheme = &input[..hash_pos];
+        let rest = &input[hash_pos + 1..];
+
+        // Validate scheme looks like a URI (contains :// or is a URN)
+        if !scheme.contains("://") && !scheme.starts_with("urn:") {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+
+        // Parse the identifier (digits)
+        let (remaining, identifier) = take_while1(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')(rest)?;
+
+        return Ok((
+            remaining,
+            EclExpression::AlternateIdentifier {
+                scheme: scheme.to_string(),
+                identifier: identifier.to_string(),
+            },
+        ));
+    }
+
+    // Try path-based identifier: http://snomed.info/id/73211009
+    // Find the last slash and check if what follows is an identifier
+    if let Some(last_slash) = input.rfind('/') {
+        let potential_scheme = &input[..last_slash];
+        let rest = &input[last_slash + 1..];
+
+        // Validate scheme looks like a URI path
+        if !potential_scheme.contains("://") {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+
+        // Check if the rest looks like an identifier (digits or alphanumeric)
+        if !rest.is_empty() && rest.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+            let (remaining, identifier) = take_while1(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')(rest)?;
+
+            return Ok((
+                remaining,
+                EclExpression::AlternateIdentifier {
+                    scheme: potential_scheme.to_string(),
+                    identifier: identifier.to_string(),
+                },
+            ));
+        }
+    }
+
+    Err(nom::Err::Error(nom::error::Error::new(
+        input,
+        nom::error::ErrorKind::Tag,
+    )))
 }
 
 fn sct_id(input: &str) -> IResult<&str, SctId> {
@@ -352,7 +473,23 @@ fn attribute_constraint(input: &str) -> IResult<&str, AttributeConstraint> {
 
     let (input, _) = ws(input)?;
 
-    // Parse the operator with optional hierarchy prefix
+    // Try to parse as concrete value constraint first (with comparison operators)
+    // This handles: `= #100`, `< #50`, `<= #200`, `> #10`, `>= #5`, `!= #0`
+    if let Ok((remaining, value_expr)) = concrete_value_with_comparison(input) {
+        return Ok((
+            remaining,
+            AttributeConstraint {
+                cardinality,
+                reverse: reverse.is_some(),
+                attribute_type: Box::new(attr_type),
+                // Use Equal as placeholder; real comparison is in the Concrete expression
+                operator: RefinementOperator::Equal,
+                value: Box::new(value_expr),
+            },
+        ));
+    }
+
+    // Parse the operator with optional hierarchy prefix for concept values
     let (input, operator) = refinement_operator(input)?;
 
     let (input, _) = ws(input)?;
@@ -504,11 +641,14 @@ fn dot_notation_tail(input: &str, left: EclExpression) -> IResult<&str, EclExpre
 // Concrete Value Parsing
 // =============================================================================
 
-/// Parse a concrete value: `#123`, `#3.14`, or `#"string"`
+/// Parse a concrete value: `#123`, `#3.14`, `#"string"`, `#true`, or `#false`
 fn concrete_value(input: &str) -> IResult<&str, ConcreteValue> {
     let (input, _) = char('#')(input)?;
 
     alt((
+        // Boolean values (must come before numbers to avoid ambiguity)
+        value(ConcreteValue::Boolean(true), tag_no_case("true")),
+        value(ConcreteValue::Boolean(false), tag_no_case("false")),
         // String value
         map(
             delimited(char('"'), take_until("\""), char('"')),
@@ -533,6 +673,7 @@ fn concrete_value(input: &str) -> IResult<&str, ConcreteValue> {
 }
 
 /// Parse a concrete value expression with comparison operator.
+/// The operator is parsed separately in attribute_constraint for refinements.
 fn concrete_value_expression(input: &str) -> IResult<&str, EclExpression> {
     let (input, value) = concrete_value(input)?;
 
@@ -542,6 +683,19 @@ fn concrete_value_expression(input: &str) -> IResult<&str, EclExpression> {
             value,
             operator: ComparisonOperator::Equal,
         },
+    ))
+}
+
+/// Parse a concrete value expression with an explicit comparison operator.
+/// Format: `= #100`, `< #50`, `<= #200`, `> #10`, `>= #5`, `!= #0`
+fn concrete_value_with_comparison(input: &str) -> IResult<&str, EclExpression> {
+    let (input, operator) = comparison_operator(input)?;
+    let (input, _) = ws(input)?;
+    let (input, value) = concrete_value(input)?;
+
+    Ok((
+        input,
+        EclExpression::Concrete { value, operator },
     ))
 }
 
@@ -1013,13 +1167,20 @@ fn id_filter(input: &str) -> IResult<&str, EclFilter> {
     Ok((input, EclFilter::Id { ids }))
 }
 
-/// Parse a single filter.
-fn single_filter(input: &str) -> IResult<&str, EclFilter> {
+/// Parse a domain prefix: `C`, `D`, or `M`
+fn domain_prefix(input: &str) -> IResult<&str, FilterDomain> {
+    alt((
+        value(FilterDomain::Concept, char('C')),
+        value(FilterDomain::Description, char('D')),
+        value(FilterDomain::Member, char('M')),
+    ))(input)
+}
+
+/// Parse a filter without domain prefix (inner filter).
+fn inner_filter(input: &str) -> IResult<&str, EclFilter> {
     alt((
         // History first (starts with +)
         history_filter,
-        // Member filter (starts with M)
-        member_filter,
         // Longer keywords first to avoid partial matches
         language_refset_filter,    // languageRefSetId
         definition_status_filter,  // definitionStatus
@@ -1035,6 +1196,37 @@ fn single_filter(input: &str) -> IResult<&str, EclFilter> {
         active_filter,             // active
         term_filter,               // term
         id_filter,                 // id (short keyword last)
+    ))(input)
+}
+
+/// Parse a single filter, optionally with domain prefix.
+fn single_filter(input: &str) -> IResult<&str, EclFilter> {
+    // Try to parse domain-qualified filter first: `C active = true`, `D term = "heart"`
+    // Domain prefix must be followed by whitespace (to distinguish from keywords like "cI")
+    if let Ok((remaining, domain)) = domain_prefix(input) {
+        // Must have whitespace after domain prefix to be valid
+        if let Ok((remaining, _)) = mws(remaining) {
+            // Parse the inner filter
+            if let Ok((remaining, filter)) = inner_filter(remaining) {
+                return Ok((
+                    remaining,
+                    EclFilter::DomainQualified {
+                        domain,
+                        filter: Box::new(filter),
+                    },
+                ));
+            }
+        }
+    }
+
+    // Fall back to regular filter parsing (including member_filter which starts with M)
+    alt((
+        // History first (starts with +)
+        history_filter,
+        // Member filter (starts with M followed by whitespace and field name)
+        member_filter,
+        // Then inner filters
+        inner_filter,
     ))(input)
 }
 
@@ -1104,7 +1296,7 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // 1. Simple Expression Constraints (from IHTSDO examples)
+    // 1. Simple Expression Constraints
     // ========================================================================
 
     mod simple_expressions {
@@ -1227,12 +1419,17 @@ mod tests {
         fn test_1_6_member_of() {
             let expr = parse("^ 700043003 |example problem list concepts reference set|").unwrap();
             match expr {
-                EclExpression::MemberOf { refset_id, term } => {
-                    assert_eq!(refset_id, 700043003);
-                    assert_eq!(
-                        term.as_deref(),
-                        Some("example problem list concepts reference set")
-                    );
+                EclExpression::MemberOf { refset } => {
+                    match refset.as_ref() {
+                        EclExpression::ConceptReference { concept_id, term } => {
+                            assert_eq!(*concept_id, 700043003);
+                            assert_eq!(
+                                term.as_deref(),
+                                Some("example problem list concepts reference set")
+                            );
+                        }
+                        _ => panic!("Expected ConceptReference inside MemberOf"),
+                    }
                 }
                 _ => panic!("Expected MemberOf"),
             }
@@ -1242,11 +1439,91 @@ mod tests {
         fn test_1_6_member_of_no_term() {
             let expr = parse("^700043003").unwrap();
             match expr {
-                EclExpression::MemberOf { refset_id, term } => {
-                    assert_eq!(refset_id, 700043003);
-                    assert!(term.is_none());
+                EclExpression::MemberOf { refset } => {
+                    match refset.as_ref() {
+                        EclExpression::ConceptReference { concept_id, term } => {
+                            assert_eq!(*concept_id, 700043003);
+                            assert!(term.is_none());
+                        }
+                        _ => panic!("Expected ConceptReference inside MemberOf"),
+                    }
                 }
                 _ => panic!("Expected MemberOf"),
+            }
+        }
+
+        /// Test: Enhanced member-of with nested expression
+        /// Example: ^ (< 723264001)
+        #[test]
+        fn test_member_of_with_nested_expression() {
+            let expr = parse("^ (< 723264001)").unwrap();
+            match expr {
+                EclExpression::MemberOf { refset } => {
+                    // The refset should be a descendant-of expression
+                    assert!(matches!(refset.as_ref(), EclExpression::DescendantOf(_)));
+                }
+                _ => panic!("Expected MemberOf"),
+            }
+        }
+
+        /// Test: Enhanced member-of with complex nested expression
+        /// Example: ^ (<< 723264001 OR << 900000000000496009)
+        #[test]
+        fn test_member_of_with_complex_nested() {
+            let expr = parse("^ (<< 723264001 OR << 900000000000496009)").unwrap();
+            match expr {
+                EclExpression::MemberOf { refset } => {
+                    // The refset should be an OR expression
+                    assert!(matches!(refset.as_ref(), EclExpression::Or(_, _)));
+                }
+                _ => panic!("Expected MemberOf"),
+            }
+        }
+
+        /// Test: Alternate identifier with fragment syntax
+        /// Example: http://snomed.info/sct#73211009
+        #[test]
+        fn test_alternate_identifier_fragment() {
+            let expr = parse("http://snomed.info/sct#73211009").unwrap();
+            match expr {
+                EclExpression::AlternateIdentifier { scheme, identifier } => {
+                    assert_eq!(scheme, "http://snomed.info/sct");
+                    assert_eq!(identifier, "73211009");
+                }
+                _ => panic!("Expected AlternateIdentifier, got {:?}", expr),
+            }
+        }
+
+        /// Test: Alternate identifier with path syntax
+        /// Example: http://snomed.info/id/73211009
+        #[test]
+        fn test_alternate_identifier_path() {
+            let expr = parse("http://snomed.info/id/73211009").unwrap();
+            match expr {
+                EclExpression::AlternateIdentifier { scheme, identifier } => {
+                    assert_eq!(scheme, "http://snomed.info/id");
+                    assert_eq!(identifier, "73211009");
+                }
+                _ => panic!("Expected AlternateIdentifier, got {:?}", expr),
+            }
+        }
+
+        /// Test: Alternate identifier in descendant expression
+        /// Example: << http://snomed.info/id/73211009
+        #[test]
+        fn test_alternate_identifier_with_operator() {
+            let expr = parse("<< http://snomed.info/id/73211009").unwrap();
+            match expr {
+                EclExpression::DescendantOrSelfOf(inner) => {
+                    match inner.as_ref() {
+                        EclExpression::AlternateIdentifier { scheme, identifier } => {
+                            assert_eq!(scheme, "http://snomed.info/id");
+                            assert_eq!(identifier, "73211009");
+                        }
+                        _ => panic!("Expected AlternateIdentifier inside DescendantOrSelfOf"),
+                    }
+                }
+                _ => panic!("Expected DescendantOrSelfOf"),
             }
         }
 
@@ -1290,7 +1567,7 @@ mod tests {
     }
 
     // ========================================================================
-    // 4. Conjunction and Disjunction (from IHTSDO examples)
+    // 4. Conjunction and Disjunction
     // ========================================================================
 
     mod compound_expressions {
@@ -1376,7 +1653,7 @@ mod tests {
     }
 
     // ========================================================================
-    // 5. Exclusion (MINUS) (from IHTSDO examples)
+    // 5. Exclusion (MINUS)
     // ========================================================================
 
     mod exclusion {
@@ -1462,7 +1739,7 @@ mod tests {
 
         #[test]
         fn test_nested_member_of() {
-            // From IHTSDO test: << ^700043003 |Example problem list concepts reference set|
+            // Nested member-of expression
             let expr = parse("<< (^700043003)").unwrap();
             match expr {
                 EclExpression::DescendantOrSelfOf(inner) => {
@@ -1496,30 +1773,35 @@ mod tests {
     }
 
     // ========================================================================
-    // IHTSDO ECLQueryBuilderTest equivalent tests
+    // Query builder pattern tests
     // ========================================================================
 
-    mod ihtsdo_query_builder_tests {
+    mod query_builder_tests {
         use super::*;
 
-        /// Test from IHTSDO: parseMemberOfQuerySyntax
+        /// Test member-of query syntax
         #[test]
         fn test_parse_member_of_query_syntax() {
             let expr =
                 parse("^700043003 |Example problem list concepts reference set|").unwrap();
             match expr {
-                EclExpression::MemberOf { refset_id, term } => {
-                    assert_eq!(refset_id, 700043003);
-                    assert_eq!(
-                        term.as_deref(),
-                        Some("Example problem list concepts reference set")
-                    );
+                EclExpression::MemberOf { refset } => {
+                    match refset.as_ref() {
+                        EclExpression::ConceptReference { concept_id, term } => {
+                            assert_eq!(*concept_id, 700043003);
+                            assert_eq!(
+                                term.as_deref(),
+                                Some("Example problem list concepts reference set")
+                            );
+                        }
+                        _ => panic!("Expected ConceptReference inside MemberOf"),
+                    }
                 }
                 _ => panic!("Expected MemberOf"),
             }
         }
 
-        /// Test from IHTSDO: parseMemberOfNestedQuerySyntax
+        /// Test member-of nested query syntax
         #[test]
         fn test_parse_member_of_nested_query_syntax_1() {
             // << ^700043003 should be interpreted as descendants of member-of
@@ -1550,13 +1832,10 @@ mod tests {
             }
         }
 
-        /// Test from IHTSDO: parseCommaWithoutSpace
-        /// "<<404684003:363698007=<<123037004,116676008=<<415582006"
-        /// Note: This includes refinements which we don't support yet, but we support
-        /// comma as AND operator at the basic level
+        /// Test comma without space as AND operator
         #[test]
         fn test_comma_without_space_simple() {
-            // Simplified version without refinements
+            // Comma acts as AND operator even without spaces
             let expr = parse("<<404684003,<<123037004").unwrap();
             assert!(matches!(expr, EclExpression::And(_, _)));
         }
@@ -2121,6 +2400,168 @@ mod tests {
                     _ => panic!("Expected Refined expression"),
                 }
             }
+
+            /// Test: Boolean true concrete value
+            #[test]
+            fn test_boolean_true_concrete_value() {
+                let expr = parse("< 404684003 : 363698007 = #true").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, .. } => {
+                                assert!(matches!(value, ConcreteValue::Boolean(true)));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Boolean false concrete value
+            #[test]
+            fn test_boolean_false_concrete_value() {
+                let expr = parse("< 404684003 : 363698007 = #false").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, .. } => {
+                                assert!(matches!(value, ConcreteValue::Boolean(false)));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Boolean case insensitive
+            #[test]
+            fn test_boolean_case_insensitive() {
+                let expr = parse("< 404684003 : 363698007 = #TRUE").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, .. } => {
+                                assert!(matches!(value, ConcreteValue::Boolean(true)));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Less than comparison for concrete value
+            #[test]
+            fn test_less_than_concrete_value() {
+                let expr = parse("< 404684003 : 363698007 < #100").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, operator } => {
+                                assert!(matches!(value, ConcreteValue::Integer(100)));
+                                assert!(matches!(operator, ComparisonOperator::LessThan));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Less than or equal comparison for concrete value
+            #[test]
+            fn test_less_than_or_equal_concrete_value() {
+                let expr = parse("< 404684003 : 363698007 <= #50").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, operator } => {
+                                assert!(matches!(value, ConcreteValue::Integer(50)));
+                                assert!(matches!(operator, ComparisonOperator::LessThanOrEqual));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Greater than comparison for concrete value
+            #[test]
+            fn test_greater_than_concrete_value() {
+                let expr = parse("< 404684003 : 363698007 > #200").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, operator } => {
+                                assert!(matches!(value, ConcreteValue::Integer(200)));
+                                assert!(matches!(operator, ComparisonOperator::GreaterThan));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Greater than or equal comparison for concrete value
+            #[test]
+            fn test_greater_than_or_equal_concrete_value() {
+                let expr = parse("< 404684003 : 363698007 >= #10").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, operator } => {
+                                assert!(matches!(value, ConcreteValue::Integer(10)));
+                                assert!(matches!(operator, ComparisonOperator::GreaterThanOrEqual));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Not equal comparison for concrete value
+            #[test]
+            fn test_not_equal_concrete_value() {
+                let expr = parse("< 404684003 : 363698007 != #0").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, operator } => {
+                                assert!(matches!(value, ConcreteValue::Integer(0)));
+                                assert!(matches!(operator, ComparisonOperator::NotEqual));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
+
+            /// Test: Decimal comparison with less than
+            #[test]
+            fn test_decimal_less_than() {
+                let expr = parse("< 404684003 : 363698007 < #3.14").unwrap();
+                match expr {
+                    EclExpression::Refined { refinement, .. } => {
+                        match refinement.ungrouped[0].value.as_ref() {
+                            EclExpression::Concrete { value, operator } => {
+                                match value {
+                                    ConcreteValue::Decimal(v) => assert!((v - 3.14).abs() < 0.001),
+                                    _ => panic!("Expected Decimal"),
+                                }
+                                assert!(matches!(operator, ComparisonOperator::LessThan));
+                            }
+                            _ => panic!("Expected Concrete value"),
+                        }
+                    }
+                    _ => panic!("Expected Refined expression"),
+                }
+            }
         }
 
         // Filter Tests
@@ -2542,6 +2983,69 @@ mod tests {
                         assert_eq!(filters.len(), 2);
                         assert!(matches!(&filters[0], EclFilter::Term { .. }));
                         assert!(matches!(&filters[1], EclFilter::Active(true)));
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Concept domain prefix
+            #[test]
+            fn test_concept_domain_prefix() {
+                use crate::ast::FilterDomain;
+                let expr = parse("<< 404684003 {{ C active = true }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::DomainQualified { domain, filter } => {
+                                assert!(matches!(domain, FilterDomain::Concept));
+                                assert!(matches!(filter.as_ref(), EclFilter::Active(true)));
+                            }
+                            _ => panic!("Expected DomainQualified filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Description domain prefix with term filter
+            #[test]
+            fn test_description_domain_prefix() {
+                use crate::ast::FilterDomain;
+                let expr = parse(r#"<< 404684003 {{ D term = "heart" }}"#).unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::DomainQualified { domain, filter } => {
+                                assert!(matches!(domain, FilterDomain::Description));
+                                match filter.as_ref() {
+                                    EclFilter::Term { match_type, value } => {
+                                        assert!(matches!(match_type, TermMatchType::Contains));
+                                        assert_eq!(value, "heart");
+                                    }
+                                    _ => panic!("Expected Term filter"),
+                                }
+                            }
+                            _ => panic!("Expected DomainQualified filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filtered expression"),
+                }
+            }
+
+            /// Test: Member domain prefix
+            #[test]
+            fn test_member_domain_prefix() {
+                use crate::ast::FilterDomain;
+                let expr = parse("<< 404684003 {{ M active = true }}").unwrap();
+                match expr {
+                    EclExpression::Filtered { filters, .. } => {
+                        match &filters[0] {
+                            EclFilter::DomainQualified { domain, filter } => {
+                                assert!(matches!(domain, FilterDomain::Member));
+                                assert!(matches!(filter.as_ref(), EclFilter::Active(true)));
+                            }
+                            _ => panic!("Expected DomainQualified filter"),
+                        }
                     }
                     _ => panic!("Expected Filtered expression"),
                 }

@@ -300,6 +300,32 @@ pub enum FilterAcceptability {
     Acceptable,
 }
 
+/// Domain prefix for filters.
+/// Specifies which component type the filter applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FilterDomain {
+    /// Concept domain (`C`).
+    /// Filter applies to concept attributes (active, definitionStatus, moduleId, effectiveTime).
+    Concept,
+    /// Description domain (`D`).
+    /// Filter applies to description attributes (term, language, type, dialect, caseSignificance).
+    Description,
+    /// Member domain (`M`).
+    /// Filter applies to reference set member attributes.
+    Member,
+}
+
+impl std::fmt::Display for FilterDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilterDomain::Concept => write!(f, "C"),
+            FilterDomain::Description => write!(f, "D"),
+            FilterDomain::Member => write!(f, "M"),
+        }
+    }
+}
+
 /// Filter types for ECL expressions.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -426,6 +452,15 @@ pub enum EclFilter {
     History {
         /// Optional profile (MIN, MOD, MAX).
         profile: Option<HistoryProfile>,
+    },
+
+    /// Domain-qualified filter: `{{ C active = true }}` or `{{ D term = "heart" }}`
+    /// The domain prefix specifies which component type the filter applies to.
+    DomainQualified {
+        /// The domain (Concept, Description, or Member).
+        domain: FilterDomain,
+        /// The inner filter.
+        filter: Box<EclFilter>,
     },
 }
 
@@ -569,6 +604,9 @@ impl std::fmt::Display for EclFilter {
                 }
                 Ok(())
             }
+            EclFilter::DomainQualified { domain, filter } => {
+                write!(f, "{} {}", domain, filter)
+            }
         }
     }
 }
@@ -659,18 +697,28 @@ pub enum EclExpression {
     Minus(Box<EclExpression>, Box<EclExpression>),
 
     /// Reference set membership.
-    /// Syntax: `^ refsetId`
+    /// Syntax: `^ refsetId` or `^ (expression)`
     /// Example: `^ 700043003 |Example problem list concepts reference set|`
+    /// Example with nested expression: `^ (< 723264001)` (members of any refset that is a descendant)
     MemberOf {
-        /// The reference set concept ID.
-        refset_id: SctId,
-        /// Optional term/label in pipe notation.
-        term: Option<String>,
+        /// The reference set expression (can be a single concept or a more complex expression).
+        refset: Box<EclExpression>,
     },
 
     /// Wildcard matching any concept.
     /// Syntax: `*`
     Any,
+
+    /// Alternate identifier for concept reference.
+    /// Syntax: `scheme#id` where scheme is typically a URI
+    /// Example: `http://snomed.info/id/73211009`
+    /// Example: `http://snomed.info/sct#73211009`
+    AlternateIdentifier {
+        /// The identifier scheme (URI prefix).
+        scheme: String,
+        /// The identifier value within that scheme.
+        identifier: String,
+    },
 
     /// Nested expression in parentheses.
     /// Used to control precedence.
@@ -729,6 +777,11 @@ pub enum EclExpression {
     /// Syntax: `!!< expression`
     /// Example: `!!< (>> 45133009 AND ^ 991411000000109)`
     BottomOfSet(Box<EclExpression>),
+
+    /// Concept reference set - a set of concept IDs.
+    /// Syntax: `(id1 id2 id3)` or `(id1 id2 id3 ...)`
+    /// Example: `(404684003 73211009 386661006)`
+    ConceptSet(Vec<SctId>),
 }
 
 impl EclExpression {
@@ -783,11 +836,20 @@ impl EclExpression {
         EclExpression::Minus(Box::new(left), Box::new(right))
     }
 
-    /// Creates a member-of expression.
+    /// Creates a member-of expression from a reference set ID.
     pub fn member_of(refset_id: SctId) -> Self {
         EclExpression::MemberOf {
-            refset_id,
-            term: None,
+            refset: Box::new(EclExpression::ConceptReference {
+                concept_id: refset_id,
+                term: None,
+            }),
+        }
+    }
+
+    /// Creates a member-of expression from an arbitrary expression.
+    pub fn member_of_expression(refset: EclExpression) -> Self {
+        EclExpression::MemberOf {
+            refset: Box::new(refset),
         }
     }
 
@@ -857,14 +919,24 @@ impl std::fmt::Display for EclExpression {
             EclExpression::And(left, right) => write!(f, "{} AND {}", left, right),
             EclExpression::Or(left, right) => write!(f, "{} OR {}", left, right),
             EclExpression::Minus(left, right) => write!(f, "{} MINUS {}", left, right),
-            EclExpression::MemberOf { refset_id, term } => {
-                if let Some(t) = term {
-                    write!(f, "^ {} |{}|", refset_id, t)
-                } else {
-                    write!(f, "^ {}", refset_id)
+            EclExpression::MemberOf { refset } => {
+                // For simple concept references, display without parentheses
+                // For complex expressions, wrap in parentheses
+                match refset.as_ref() {
+                    EclExpression::ConceptReference { concept_id, term } => {
+                        if let Some(t) = term {
+                            write!(f, "^ {} |{}|", concept_id, t)
+                        } else {
+                            write!(f, "^ {}", concept_id)
+                        }
+                    }
+                    _ => write!(f, "^ ({})", refset),
                 }
             }
             EclExpression::Any => write!(f, "*"),
+            EclExpression::AlternateIdentifier { scheme, identifier } => {
+                write!(f, "{}#{}", scheme, identifier)
+            }
             EclExpression::Nested(inner) => write!(f, "({})", inner),
             EclExpression::Refined { focus, refinement } => {
                 write!(f, "{} : {}", focus, refinement)
@@ -887,6 +959,16 @@ impl std::fmt::Display for EclExpression {
             }
             EclExpression::TopOfSet(inner) => write!(f, "!!> {}", inner),
             EclExpression::BottomOfSet(inner) => write!(f, "!!< {}", inner),
+            EclExpression::ConceptSet(ids) => {
+                write!(f, "(")?;
+                for (i, id) in ids.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}", id)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }

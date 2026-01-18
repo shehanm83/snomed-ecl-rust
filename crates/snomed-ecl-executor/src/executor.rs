@@ -320,17 +320,30 @@ impl<'a> EclExecutor<'a> {
                 Ok((result, left_count + right_count))
             }
 
-            // Member of: ^ refset_id
-            EclExpression::MemberOf { refset_id, .. } => {
-                let members: HashSet<SctId> = self
-                    .store
-                    .get_refset_members(*refset_id)
-                    .into_iter()
-                    .collect();
-                if members.is_empty() {
-                    return Err(EclExecutorError::RefsetNotFound(*refset_id));
+            // Member of: ^ refset_id or ^ (expression)
+            EclExpression::MemberOf { refset } => {
+                // First, evaluate the refset expression to get the set of refset IDs
+                let (refset_ids, refset_count) = self.execute_expression(refset, traverser)?;
+
+                // Get members from all matching refsets
+                let mut members: HashSet<SctId> = HashSet::new();
+                let mut found_any = false;
+                for refset_id in &refset_ids {
+                    let refset_members = self.store.get_refset_members(*refset_id);
+                    if !refset_members.is_empty() {
+                        found_any = true;
+                        members.extend(refset_members);
+                    }
                 }
-                let count = members.len();
+
+                if !found_any && refset_ids.len() == 1 {
+                    // If we had a single refset and found no members, report error
+                    if let Some(&single_id) = refset_ids.iter().next() {
+                        return Err(EclExecutorError::RefsetNotFound(single_id));
+                    }
+                }
+
+                let count = members.len() + refset_count;
                 Ok((members, count))
             }
 
@@ -339,6 +352,18 @@ impl<'a> EclExecutor<'a> {
                 let all: HashSet<SctId> = self.store.all_concept_ids().collect();
                 let count = all.len();
                 Ok((all, count))
+            }
+
+            // Alternate identifier: http://snomed.info/id/73211009
+            EclExpression::AlternateIdentifier { scheme, identifier } => {
+                if let Some(concept_id) = self.store.resolve_alternate_identifier(scheme, identifier) {
+                    let mut result = HashSet::new();
+                    result.insert(concept_id);
+                    Ok((result, 1))
+                } else {
+                    // Identifier could not be resolved - return empty set
+                    Ok((HashSet::new(), 0))
+                }
             }
 
             // Nested expressions are unwrapped at the start
@@ -361,13 +386,30 @@ impl<'a> EclExecutor<'a> {
                 let mut total_count = focus_count;
 
                 for concept_id in focus_concepts {
-                    let attributes = self.store.get_attributes(concept_id);
+                    // Get both outbound and inbound relationships (lazily, only if needed)
+                    let outbound_attrs = self.store.get_attributes(concept_id);
+                    let mut inbound_attrs: Option<Vec<_>> = None;
                     let mut matches = true;
 
                     // Check ungrouped attribute constraints
                     for constraint in &refinement.ungrouped {
-                        if !self.evaluate_attribute_constraint(constraint, &attributes, traverser)?
-                        {
+                        // Get appropriate relationships based on reverse flag
+                        let attrs: &[crate::traits::RelationshipInfo] = if constraint.reverse {
+                            // Lazy initialization of inbound relationships
+                            if inbound_attrs.is_none() {
+                                inbound_attrs = Some(self.store.get_inbound_relationships(concept_id));
+                            }
+                            inbound_attrs.as_ref().unwrap()
+                        } else {
+                            &outbound_attrs
+                        };
+
+                        if !self.evaluate_attribute_constraint(
+                            concept_id,
+                            constraint,
+                            attrs,
+                            traverser,
+                        )? {
                             matches = false;
                             break;
                         }
@@ -376,7 +418,23 @@ impl<'a> EclExecutor<'a> {
                     // Check grouped attribute constraints
                     if matches {
                         for group in &refinement.groups {
-                            if !self.evaluate_attribute_group(group, &attributes, traverser)? {
+                            // For groups, check if any constraint has reverse flag
+                            let has_reverse = group.constraints.iter().any(|c| c.reverse);
+                            let attrs: &[crate::traits::RelationshipInfo] = if has_reverse {
+                                if inbound_attrs.is_none() {
+                                    inbound_attrs = Some(self.store.get_inbound_relationships(concept_id));
+                                }
+                                inbound_attrs.as_ref().unwrap()
+                            } else {
+                                &outbound_attrs
+                            };
+
+                            if !self.evaluate_attribute_group(
+                                concept_id,
+                                group,
+                                attrs,
+                                traverser,
+                            )? {
                                 matches = false;
                                 break;
                             }
@@ -386,7 +444,7 @@ impl<'a> EclExecutor<'a> {
                     if matches {
                         result.insert(concept_id);
                     }
-                    total_count += attributes.len();
+                    total_count += outbound_attrs.len();
                 }
 
                 Ok((result, total_count))
@@ -480,12 +538,23 @@ impl<'a> EclExecutor<'a> {
 
                 Ok((result, count + concepts.len()))
             }
+
+            EclExpression::ConceptSet(ids) => {
+                // Return all valid concept IDs from the set
+                let result: HashSet<SctId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| self.store.has_concept(id))
+                    .collect();
+                Ok((result, ids.len()))
+            }
         }
     }
 
     /// Evaluates a single attribute constraint against a concept's attributes.
     fn evaluate_attribute_constraint(
         &self,
+        concept_id: SctId,
         constraint: &snomed_ecl::AttributeConstraint,
         attributes: &[crate::traits::RelationshipInfo],
         traverser: &HierarchyTraverser<'_>,
@@ -495,7 +564,18 @@ impl<'a> EclExecutor<'a> {
         // Get the set of acceptable attribute types
         let attr_types = self.execute_expression(&constraint.attribute_type, traverser)?;
 
-        // Get the set of acceptable values
+        // Check if this is a concrete value constraint
+        if let snomed_ecl::EclExpression::Concrete { value, operator } = constraint.value.as_ref() {
+            return self.evaluate_concrete_constraint(
+                concept_id,
+                constraint,
+                &attr_types.0,
+                value,
+                *operator,
+            );
+        }
+
+        // Get the set of acceptable values for concept-to-concept relationships
         let acceptable_values = self.execute_expression(&constraint.value, traverser)?;
 
         // Find matching attributes
@@ -552,9 +632,133 @@ impl<'a> EclExecutor<'a> {
         }
     }
 
+    /// Evaluates a concrete value constraint against a concept's concrete relationships.
+    fn evaluate_concrete_constraint(
+        &self,
+        concept_id: SctId,
+        constraint: &snomed_ecl::AttributeConstraint,
+        attr_types: &HashSet<SctId>,
+        target_value: &snomed_ecl::ConcreteValue,
+        operator: snomed_ecl::ComparisonOperator,
+    ) -> EclResult<bool> {
+        // Get concrete relationships for this concept
+        let concrete_rels = self.store.get_concrete_values(concept_id);
+
+        // Find matching concrete relationships
+        let matching_count = concrete_rels
+            .iter()
+            .filter(|rel| {
+                // Check if attribute type matches (or wildcard)
+                let type_matches = matches!(
+                    constraint.attribute_type.as_ref(),
+                    snomed_ecl::EclExpression::Any
+                ) || attr_types.contains(&rel.type_id);
+
+                if !type_matches {
+                    return false;
+                }
+
+                // Compare the concrete value
+                Self::compare_concrete_values(&rel.value, target_value, operator)
+            })
+            .count();
+
+        // Check cardinality
+        if let Some(ref card) = constraint.cardinality {
+            Ok(card.matches(matching_count))
+        } else {
+            // No cardinality means at least one match required
+            Ok(matching_count > 0)
+        }
+    }
+
+    /// Compares a concrete relationship value against a target value using the given operator.
+    fn compare_concrete_values(
+        actual: &crate::traits::ConcreteValueRef,
+        target: &snomed_ecl::ConcreteValue,
+        operator: snomed_ecl::ComparisonOperator,
+    ) -> bool {
+        use snomed_ecl::ComparisonOperator;
+        use snomed_ecl::ConcreteValue;
+        use crate::traits::ConcreteValueRef;
+
+        match (actual, target) {
+            // Integer comparisons
+            (ConcreteValueRef::Integer(a), ConcreteValue::Integer(t)) => {
+                match operator {
+                    ComparisonOperator::Equal => *a == *t,
+                    ComparisonOperator::NotEqual => *a != *t,
+                    ComparisonOperator::LessThan => *a < *t,
+                    ComparisonOperator::LessThanOrEqual => *a <= *t,
+                    ComparisonOperator::GreaterThan => *a > *t,
+                    ComparisonOperator::GreaterThanOrEqual => *a >= *t,
+                }
+            }
+            // Decimal comparisons
+            (ConcreteValueRef::Decimal(a), ConcreteValue::Decimal(t)) => {
+                match operator {
+                    ComparisonOperator::Equal => (*a - *t).abs() < f64::EPSILON,
+                    ComparisonOperator::NotEqual => (*a - *t).abs() >= f64::EPSILON,
+                    ComparisonOperator::LessThan => *a < *t,
+                    ComparisonOperator::LessThanOrEqual => *a <= *t,
+                    ComparisonOperator::GreaterThan => *a > *t,
+                    ComparisonOperator::GreaterThanOrEqual => *a >= *t,
+                }
+            }
+            // Integer vs Decimal (promote integer to decimal)
+            (ConcreteValueRef::Integer(a), ConcreteValue::Decimal(t)) => {
+                let a_f = *a as f64;
+                match operator {
+                    ComparisonOperator::Equal => (a_f - *t).abs() < f64::EPSILON,
+                    ComparisonOperator::NotEqual => (a_f - *t).abs() >= f64::EPSILON,
+                    ComparisonOperator::LessThan => a_f < *t,
+                    ComparisonOperator::LessThanOrEqual => a_f <= *t,
+                    ComparisonOperator::GreaterThan => a_f > *t,
+                    ComparisonOperator::GreaterThanOrEqual => a_f >= *t,
+                }
+            }
+            (ConcreteValueRef::Decimal(a), ConcreteValue::Integer(t)) => {
+                let t_f = *t as f64;
+                match operator {
+                    ComparisonOperator::Equal => (*a - t_f).abs() < f64::EPSILON,
+                    ComparisonOperator::NotEqual => (*a - t_f).abs() >= f64::EPSILON,
+                    ComparisonOperator::LessThan => *a < t_f,
+                    ComparisonOperator::LessThanOrEqual => *a <= t_f,
+                    ComparisonOperator::GreaterThan => *a > t_f,
+                    ComparisonOperator::GreaterThanOrEqual => *a >= t_f,
+                }
+            }
+            // String comparisons (only = and != make sense)
+            (ConcreteValueRef::String(a), ConcreteValue::String(t)) => {
+                match operator {
+                    ComparisonOperator::Equal => a == t,
+                    ComparisonOperator::NotEqual => a != t,
+                    // Lexicographic comparison for strings
+                    ComparisonOperator::LessThan => a < t,
+                    ComparisonOperator::LessThanOrEqual => a <= t,
+                    ComparisonOperator::GreaterThan => a > t,
+                    ComparisonOperator::GreaterThanOrEqual => a >= t,
+                }
+            }
+            // Boolean comparisons (only = and != make sense)
+            (ConcreteValueRef::Integer(a), ConcreteValue::Boolean(t)) => {
+                // Treat 0 as false, non-zero as true
+                let a_bool = *a != 0;
+                match operator {
+                    ComparisonOperator::Equal => a_bool == *t,
+                    ComparisonOperator::NotEqual => a_bool != *t,
+                    _ => false, // Other comparisons don't make sense for booleans
+                }
+            }
+            // Type mismatches
+            _ => false,
+        }
+    }
+
     /// Evaluates an attribute group against a concept's attributes.
     fn evaluate_attribute_group(
         &self,
+        concept_id: SctId,
         group: &snomed_ecl::AttributeGroup,
         attributes: &[crate::traits::RelationshipInfo],
         traverser: &HierarchyTraverser<'_>,
@@ -588,7 +792,12 @@ impl<'a> EclExecutor<'a> {
             // Check if all constraints are satisfied within this group
             let mut all_constraints_met = true;
             for constraint in &group.constraints {
-                if !self.evaluate_attribute_constraint(constraint, &group_attrs, traverser)? {
+                if !self.evaluate_attribute_constraint(
+                    concept_id,
+                    constraint,
+                    &group_attrs,
+                    traverser,
+                )? {
                     all_constraints_met = false;
                     break;
                 }
@@ -892,6 +1101,15 @@ impl<'a> EclExecutor<'a> {
                 // Member filters require refset access - return as-is for now
                 // Full implementation would filter based on refset member fields
                 Ok(concepts.clone())
+            }
+
+            EclFilter::DomainQualified { domain: _, filter } => {
+                // Domain-qualified filters: the domain indicates which component type to filter
+                // For now, we delegate to the inner filter since most filters already have
+                // implicit domain semantics (e.g., term filters are always description-based)
+                // Full implementation would use domain to disambiguate when filters can
+                // apply to multiple domains (like active, effectiveTime, moduleId)
+                self.apply_filter(concepts, filter)
             }
         }
     }

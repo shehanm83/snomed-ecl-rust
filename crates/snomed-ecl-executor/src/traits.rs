@@ -339,6 +339,29 @@ pub trait EclQueryable: Send + Sync {
         let _ = (concept_id, association_type);
         Vec::new()
     }
+
+    /// Resolves an alternate identifier to a SNOMED CT concept ID.
+    ///
+    /// Alternate identifiers use different schemes to identify concepts:
+    /// - `http://snomed.info/id/73211009` - SNOMED CT URI scheme
+    /// - `http://snomed.info/sct#73211009` - SNOMED CT fragment scheme
+    /// - Other custom identifier schemes
+    ///
+    /// Returns `Some(concept_id)` if the identifier can be resolved, `None` otherwise.
+    ///
+    /// # Arguments
+    /// * `scheme` - The identifier scheme (URI prefix)
+    /// * `identifier` - The identifier value within that scheme
+    fn resolve_alternate_identifier(&self, scheme: &str, identifier: &str) -> Option<SctId> {
+        // Default implementation: try to parse SNOMED CT URIs
+        // http://snomed.info/id/73211009 or http://snomed.info/sct#73211009
+        if scheme == "http://snomed.info/id" || scheme == "http://snomed.info/sct" {
+            identifier.parse::<SctId>().ok().filter(|&id| self.has_concept(id))
+        } else {
+            // Unknown scheme - can be overridden by implementations
+            None
+        }
+    }
 }
 
 /// Historical association types for history supplements.
