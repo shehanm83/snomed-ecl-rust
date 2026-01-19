@@ -1,188 +1,163 @@
 # snomed-ecl-rust
 
-A modular Rust implementation of SNOMED CT Expression Constraint Language (ECL).
+A modular Rust implementation of SNOMED CT Expression Constraint Language (ECL) version 2.2.
+
+## What is ECL?
+
+**Expression Constraint Language (ECL)** is a formal query language for selecting sets of clinical concepts from SNOMED CT. Think of it as "SQL for medical terminology."
+
+```rust
+use snomed_ecl::parse;
+
+// Parse ECL expression
+let ast = parse("<< 73211009 |Diabetes mellitus|")?;
+
+// This represents: "Diabetes and all its subtypes"
+// Including: Type 1 diabetes, Type 2 diabetes, Gestational diabetes, etc.
+```
 
 ## Crate Structure
 
 This workspace provides three independent crates that can be used separately or together:
 
-| Crate | Purpose | Dependencies |
-|-------|---------|--------------|
-| `snomed-ecl` | **Parser only** - converts ECL strings to AST | `nom`, `thiserror` |
-| `snomed-ecl-executor` | **Execution engine** - runs ECL against any data store | `snomed-ecl`, `lru` |
-| `snomed-ecl-optimizer` | **Performance optimizations** - transitive closure, bitsets, caching | `snomed-ecl-executor`, optional deps |
+| Crate | Purpose | Use Case |
+|-------|---------|----------|
+| [`snomed-ecl`](docs/parser/README.md) | **Parser** - ECL strings to AST | Translate ECL to SQL/Elasticsearch |
+| [`snomed-ecl-executor`](docs/executor/README.md) | **Executor** - Run ECL queries | Query any SNOMED CT store |
+| [`snomed-ecl-optimizer`](docs/optimizer/README.md) | **Optimizer** - Performance | Production with 350k+ concepts |
 
 ```
 ┌─────────────────────────┐
-│      snomed-ecl         │  ← Parser only
+│      snomed-ecl         │  ← Parser only (no dependencies on data)
 │   ECL String → AST      │
 └───────────┬─────────────┘
             │ optional
 ┌───────────▼─────────────┐
-│  snomed-ecl-executor    │  ← Execute against EclQueryable trait
+│  snomed-ecl-executor    │  ← Execute against any EclQueryable store
 │   AST → Query Results   │
 └───────────┬─────────────┘
             │ optional
 ┌───────────▼─────────────┐
-│  snomed-ecl-optimizer   │  ← Performance features (feature-gated)
-│   O(1) lookups, caching │
+│  snomed-ecl-optimizer   │  ← O(1) queries, bitmap operations
+│   Performance features  │
 └─────────────────────────┘
 ```
 
-## Usage
+## Quick Start
 
-### Parser Only (Minimal Dependencies)
-
-Use this when you want to parse ECL and handle execution yourself (e.g., translate to Elasticsearch queries).
+### Parser Only
 
 ```toml
 [dependencies]
-snomed-ecl = "0.1"
+snomed-ecl = { git = "https://github.com/your-repo/snomed-ecl-rust.git" }
 ```
 
 ```rust
 use snomed_ecl::{parse, EclExpression};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ast = parse("<< 404684003 |Clinical finding|")?;
+let ast = parse("<< 404684003 |Clinical finding|")?;
 
-    match ast {
-        EclExpression::DescendantOrSelfOf(inner) => {
-            println!("Query for descendants of: {:?}", inner);
-            // Translate to your backend (Elasticsearch, SQL, etc.)
-        }
-        EclExpression::And(left, right) => {
-            // Handle compound expressions
-        }
-        // ... handle other variants
-        _ => {}
+match ast {
+    EclExpression::DescendantOrSelfOf(inner) => {
+        // Translate to your backend
     }
-
-    Ok(())
+    _ => {}
 }
 ```
 
 ### Parser + Executor
 
-Use this when you have a SNOMED CT data store and want built-in execution.
-
 ```toml
 [dependencies]
-snomed-ecl = "0.1"
-snomed-ecl-executor = "0.1"
+snomed-ecl-executor = { git = "https://github.com/your-repo/snomed-ecl-rust.git" }
 ```
 
 ```rust
 use snomed_ecl_executor::{EclExecutor, EclQueryable};
-use snomed_ecl::SctId;
 
-// Implement the trait for your data store
-struct MyStore { /* your data */ }
-
+// Implement EclQueryable for your data store
 impl EclQueryable for MyStore {
-    fn get_children(&self, concept_id: SctId) -> Vec<SctId> {
-        // Return direct children from your store
-        todo!()
-    }
-
-    fn get_parents(&self, concept_id: SctId) -> Vec<SctId> {
-        // Return direct parents from your store
-        todo!()
-    }
-
-    fn has_concept(&self, concept_id: SctId) -> bool {
-        // Check if concept exists
-        todo!()
-    }
-
-    fn all_concept_ids(&self) -> Box<dyn Iterator<Item = SctId> + '_> {
-        // Return iterator over all concept IDs
-        todo!()
-    }
-
-    fn get_refset_members(&self, refset_id: SctId) -> Vec<SctId> {
-        // Return members of a reference set
-        todo!()
-    }
+    fn get_children(&self, id: u64) -> Vec<u64> { /* ... */ }
+    fn get_parents(&self, id: u64) -> Vec<u64> { /* ... */ }
+    fn has_concept(&self, id: u64) -> bool { /* ... */ }
+    fn all_concept_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> { /* ... */ }
+    fn get_refset_members(&self, id: u64) -> Vec<u64> { vec![] }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = MyStore { /* ... */ };
-    let executor = EclExecutor::new(&store);
-
-    // Execute ECL queries
-    let result = executor.execute("<< 404684003")?;
-    println!("Found {} concepts", result.count());
-
-    // Check if a concept matches
-    let is_clinical_finding = executor.matches(12345678, "<< 404684003")?;
-
-    Ok(())
-}
+let executor = EclExecutor::new(&store);
+let result = executor.execute("<< 73211009")?;
+println!("Found {} diabetes concepts", result.count());
 ```
 
 ### With Performance Optimizations
 
-Use this for production workloads with large SNOMED CT datasets.
-
 ```toml
 [dependencies]
-snomed-ecl = "0.1"
-snomed-ecl-executor = "0.1"
-snomed-ecl-optimizer = { version = "0.1", features = ["full"] }
+snomed-ecl-optimizer = { git = "...", features = ["full"] }
 ```
 
 ```rust
 use snomed_ecl_optimizer::closure::TransitiveClosure;
-use snomed_ecl_executor::EclExecutor;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = MyStore { /* ... */ };
+// Build transitive closure (one-time)
+let closure = TransitiveClosure::build(&store);
 
-    // Build transitive closure for O(1) ancestor/descendant queries
-    let closure = TransitiveClosure::build(&store);
-    println!("Built closure: {}", closure.stats());
-
-    // Use closure as the store (implements EclQueryable)
-    let executor = EclExecutor::new(&closure);
-
-    // Now hierarchy queries are O(1) instead of O(n)
-    let result = executor.execute("<< 404684003")?;
-
-    Ok(())
-}
+// Now hierarchy queries are O(1) instead of O(n)
+let executor = EclExecutor::new(&closure);
+let result = executor.execute("<< 404684003")?;  // Instant!
 ```
 
-## Feature Flags (snomed-ecl-optimizer)
+## ECL Support (v2.2)
 
-| Feature | Description |
-|---------|-------------|
-| `closure` | Precomputed transitive closure for O(1) hierarchy queries |
-| `bitset` | Roaring bitmap-based concept sets |
-| `persistence` | Save/load compiled bitsets to disk |
-| `filter-service` | Runtime filtering service with LRU caching |
-| `full` | Enable all optimizations |
+| Category | Features | Status |
+|----------|----------|--------|
+| **Hierarchy** | `<` `<<` `>` `>>` `<!` `>!` `<<!` `>>!` | ✅ Full |
+| **Compound** | `AND` `OR` `MINUS` `()` | ✅ Full |
+| **Member Of** | `^` with nested expressions | ✅ Full |
+| **Refinement** | `: attr = value`, groups `{ }`, cardinality `[n..m]` | ✅ Full |
+| **Filters** | `active`, `term`, `moduleId`, `definitionStatus`, etc. | ✅ Full |
+| **Concrete Values** | `#123` `#3.14` `#"string"` `#true` | ✅ Full |
+| **Dot Notation** | `. attribute` chaining | ✅ Full |
+| **History** | `+HISTORY-MIN/MOD/MAX` | ✅ Full |
+| **Alternate IDs** | `http://snomed.info/id/123` | ✅ Full |
 
-## ECL Support
+## Documentation
 
-### Fully Implemented
+### Parser (`snomed-ecl`)
+- [Overview & ECL Introduction](docs/parser/README.md) - What is ECL, specification overview
+- [Syntax Reference](docs/parser/SYNTAX.md) - Complete ECL syntax with examples
+- [Filters Guide](docs/parser/FILTERS.md) - All filter types explained
+- [Usage Guide](docs/parser/USAGE.md) - Code examples and patterns
 
-- Hierarchy operators: `<`, `<<`, `>`, `>>`, `<!`, `<<!`, `>!`, `>>!`
-- Compound: `AND`, `OR`, `MINUS`
-- Member of: `^`
-- Wildcard: `*`
-- Nested expressions: `()`
-- Attribute refinement: `: attribute = value`
-- Attribute groups: `{ }`
-- Cardinality: `[min..max]`
-- Dot notation: `.`
-- Concrete values: `#123`, `#3.14`, `#"string"`
-- Top/Bottom of set: `!!>`, `!!<`
-- Basic filters: `{{ term = "x" }}`, `{{ active = true }}`
+### Executor (`snomed-ecl-executor`)
+- [Overview & Architecture](docs/executor/README.md) - How the executor works
+- [EclQueryable Trait](docs/executor/TRAIT.md) - Implementing the trait
+- [Usage Guide](docs/executor/USAGE.md) - Query examples, configuration, integration
 
-### Partially Implemented
+### Optimizer (`snomed-ecl-optimizer`)
+- [Performance Guide](docs/optimizer/README.md) - Closure, bitmaps, persistence
 
-See [docs/ECL_COMPLIANCE_GAPS.md](docs/ECL_COMPLIANCE_GAPS.md) for detailed gap analysis.
+## Feature Flags
+
+| Feature | Crate | Description |
+|---------|-------|-------------|
+| `closure` | optimizer | Precomputed transitive closure |
+| `bitset` | optimizer | Roaring bitmap operations |
+| `persistence` | optimizer | Save/load to disk |
+| `filter-service` | optimizer | Filter result caching |
+| `full` | optimizer | All optimizations |
+
+## Test Coverage
+
+```
+353 tests passing
+├── 161 parser tests
+├── 135 executor unit tests
+├── 34 integration tests
+├── 10 filter tests
+├── 6 syntax tests
+└── 7 doc tests
+```
 
 ## License
 
@@ -191,4 +166,4 @@ Apache-2.0
 ## References
 
 - [ECL Specification](https://docs.snomed.org/snomed-ct-specifications/snomed-ct-expression-constraint-language)
-- [SNOMED CT Expression Constraint Language](https://confluence.ihtsdotools.org/display/DOCECL)
+- [SNOMED CT Documentation](https://confluence.ihtsdotools.org/display/DOCECL)
