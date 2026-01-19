@@ -19,6 +19,121 @@ The `snomed-ecl-optimizer` crate provides optional performance enhancements for 
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## How It Works: Data Flow Architecture
+
+**Important:** The optimizer does NOT have its own data source. It **builds from your existing store** and creates optimized in-memory structures.
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            INITIALIZATION PHASE                              │
+│                         (One-time at application startup)                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────┐                                                    │
+│  │  YOUR DATA SOURCE   │  ← You provide this (database, files, etc.)        │
+│  │  (implements        │                                                    │
+│  │   EclQueryable)     │                                                    │
+│  └──────────┬──────────┘                                                    │
+│             │                                                                │
+│             │ 1. Read all concepts: store.all_concept_ids()                 │
+│             │ 2. Read all parents:  store.get_parents(id) for each concept  │
+│             │ 3. Compute transitive closure (all ancestor/descendant pairs) │
+│             │                                                                │
+│             ▼                                                                │
+│  ┌─────────────────────┐                                                    │
+│  │ TransitiveClosure   │  ← Precomputed in-memory structure                 │
+│  │ (also implements    │     - HashMap<SctId, HashSet<SctId>> ancestors     │
+│  │  EclQueryable)      │     - HashMap<SctId, HashSet<SctId>> descendants   │
+│  └──────────┬──────────┘                                                    │
+│             │                                                                │
+│             │ 4. (Optional) Save to disk for faster restart                 │
+│             ▼                                                                │
+│  ┌─────────────────────┐                                                    │
+│  │  closure.bin        │  ← Persistent cache file                           │
+│  │  (on disk)          │                                                    │
+│  └─────────────────────┘                                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              RUNTIME PHASE                                   │
+│                            (Every ECL query)                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────┐    ┌─────────────────────┐                         │
+│  │  ECL Query          │───▶│  EclExecutor        │                         │
+│  │  "<< 73211009"      │    │                     │                         │
+│  └─────────────────────┘    └──────────┬──────────┘                         │
+│                                        │                                     │
+│                                        │ Calls closure.get_descendants()     │
+│                                        │ instead of traversing tree          │
+│                                        ▼                                     │
+│                             ┌─────────────────────┐                         │
+│                             │ TransitiveClosure   │  ← O(1) lookup!         │
+│                             │ (in memory)         │                         │
+│                             └──────────┬──────────┘                         │
+│                                        │                                     │
+│                                        ▼                                     │
+│                             ┌─────────────────────┐                         │
+│                             │  Query Results      │                         │
+│                             │  HashSet<SctId>     │                         │
+│                             └─────────────────────┘                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Points
+
+1. **You must provide a data store** - The optimizer reads from YOUR `EclQueryable` implementation
+2. **Build happens once** - At startup, read all data from store → build closure
+3. **Closure replaces store** - Pass the closure (not original store) to `EclExecutor`
+4. **Original store not needed at runtime** - After building, queries use only the closure
+5. **Persistence avoids rebuild** - Save closure to disk, load on next startup
+
+### Initialization Sequence
+
+```rust
+// STEP 1: You provide a store that implements EclQueryable
+// This could be: database, in-memory HashMap, file-based, etc.
+let my_store = MySnomeCtStore::load_from_database()?;
+
+// STEP 2: Build closure FROM your store (reads all data)
+// This is the expensive operation - traverses entire hierarchy
+let closure = TransitiveClosure::build(&my_store);
+
+// STEP 3: (Optional) Save to disk for faster startup next time
+save_closure(&closure, "closure.bin")?;
+
+// STEP 4: Use closure as the store for executor
+// The closure implements EclQueryable, so it can be used directly
+let executor = EclExecutor::new(&closure);
+
+// Now queries are O(1) instead of O(n)
+let result = executor.execute("<< 73211009")?;
+```
+
+### On Subsequent Startups
+
+```rust
+// Load pre-built closure instead of rebuilding
+let closure = if Path::new("closure.bin").exists() {
+    load_closure("closure.bin")?  // Fast: just deserialize
+} else {
+    let store = MyStore::load()?;
+    let closure = TransitiveClosure::build(&store);  // Slow: traverse hierarchy
+    save_closure(&closure, "closure.bin")?;
+    closure
+};
+
+let executor = EclExecutor::new(&closure);
+```
+
+---
+
 ## Features
 
 | Feature | Description | Use Case |
@@ -46,6 +161,66 @@ snomed-ecl-optimizer = {
 ### What is Transitive Closure?
 
 The transitive closure precomputes ALL ancestor-descendant relationships, turning O(n) tree traversal into O(1) lookup.
+
+### What Gets Stored in the Closure
+
+When you call `TransitiveClosure::build(&store)`, it:
+
+```
+BUILD PROCESS:
+─────────────────────────────────────────────────────────────────────────────
+Step 1: Collect all concept IDs
+        → store.all_concept_ids() returns [100, 200, 300, 400, 500, ...]
+        → Stored in: HashSet<SctId> concepts
+
+Step 2: For each concept, get direct parents
+        → store.get_parents(400) returns [200]
+        → store.get_parents(200) returns [100]
+        → Stored in: HashMap<SctId, Vec<SctId>> parents
+                     HashMap<SctId, Vec<SctId>> children (inverse)
+
+Step 3: For each concept, compute ALL ancestors (transitive)
+        → BFS traversal: 400 → 200 → 100 (stop at root)
+        → Result for 400: {200, 100}
+        → Stored in: HashMap<SctId, HashSet<SctId>> ancestors
+
+Step 4: For each concept, compute ALL descendants (transitive)
+        → BFS traversal: 100 → {200, 300} → {400, 500, 600}
+        → Result for 100: {200, 300, 400, 500, 600}
+        → Stored in: HashMap<SctId, HashSet<SctId>> descendants
+─────────────────────────────────────────────────────────────────────────────
+```
+
+**Final in-memory structure:**
+
+```rust
+pub struct TransitiveClosure {
+    concepts: HashSet<SctId>,                    // All concept IDs
+    parents: HashMap<SctId, Vec<SctId>>,         // Direct parents
+    children: HashMap<SctId, Vec<SctId>>,        // Direct children
+    ancestors: HashMap<SctId, HashSet<SctId>>,   // ALL ancestors (precomputed)
+    descendants: HashMap<SctId, HashSet<SctId>>, // ALL descendants (precomputed)
+}
+```
+
+### Required Store Methods
+
+Your store only needs to implement these methods for the closure to build:
+
+```rust
+impl EclQueryable for MyStore {
+    // Required for closure building:
+    fn all_concept_ids(&self) -> Box<dyn Iterator<Item = SctId> + '_>;
+    fn get_parents(&self, id: SctId) -> Vec<SctId>;
+
+    // Also required by EclQueryable trait:
+    fn get_children(&self, id: SctId) -> Vec<SctId>;
+    fn has_concept(&self, id: SctId) -> bool;
+    fn get_refset_members(&self, id: SctId) -> Vec<SctId>;
+}
+```
+
+See [EclQueryable Trait Documentation](../executor/TRAIT.md) for complete implementation guide.
 
 **Without closure:**
 ```
