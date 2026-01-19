@@ -2,9 +2,9 @@
 name = "snomed-ecl-executor"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "High-performance ECL execution engine for SNOMED CT"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/shehanm83/snomed-ecl-rust"
 keywords = ["snomed", "ecl", "healthcare", "terminology"]
 categories = ["science", "parsing"]
 
